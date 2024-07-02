@@ -1,0 +1,48 @@
+This code was used in the following way:
+
+A_processing_gencode:
+    Process GENCODE v45 to extract coordinates for 5' UTRs
+    and the first 6bp of the CDS, up to a limit of 250nt.
+
+    The files produced by 4_make_df_coordinates_ukb.R and
+    5_make_df_coordinates_6bp_ukb.R were used to extract
+    UKB variants using DNA nexus.
+
+    Scripts:
+      - 1_clean_up_gencode_gene_ann.R
+      - 2_clean_up_gencode_transcripts.R
+      - 3_make_5utr_ref_df.R
+      - 4_make_df_coordinates_ukb.R
+      - 5_make_df_coordinates_6bp_ukb.R
+
+    (All code was run on Sherlock, Stanford's computing cluster)
+
+-----------------------------------------------------------------------
+
+B_processing_UKB_WGS_variants:
+    Process UKB variants extracted from DNA Nexus from the
+    500K WGS data release in December 2023.
+
+    The key files produced by this set of scripts are
+    UKB_observed_variants_annotated.csv and
+    UKB_invariant_variants_annotated_top40hs_AR.csv, which are
+    then used to produce the final panel.
+
+    Scripts:
+      - 1_combine_ukb_variants_all.R
+      - 2_annotate_ukb_variants.R
+      - 3_make_invariant_sites.R
+      - 4_combine_chr_files.R
+
+    (All code was run on Sherlock, Stanford's computing cluster)
+
+-----------------------------------------------------------------------
+
+C_make_1M_panel:
+    Filtering of UKB variants and strategic selection of a panel
+    of 1M variants for NaP-TRAP.
+
+    Scripts:
+      - panel_design_FINAL.R
+
+    (Note that this code was run locally.)
