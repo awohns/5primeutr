@@ -908,7 +908,7 @@ df = run_ash(df, n_categories=4,
              'pw_mean_log2_diploid', 'pw_se_log2_diploid',
              'ash_posterior_mean_log2_diploid', 'ash_posterior_se_log2_diploid')
 
-df = run_ash(df, n_categories=1, 
+df = run_ash(df, n_categories=4,
              'pw_mean_log2_delta_t', 'pw_se_log2_delta_t',
              'ash_posterior_mean_log2_delta_t', 'ash_posterior_se_log2_delta_t')
 
