@@ -193,11 +193,8 @@ calculate_delta_translation = function(df, reference_txt){
              delta_t3 = (translation3/ref3),
              delta_t4 = (translation4/ref4)) %>%
       
-      select(-ref1, -ref2, -ref3, -ref4) %>%
-      select(-delta_t1, -delta_t2, -delta_t3, -delta_t4)
+      select(-ref1, -ref2, -ref3, -ref4)
       
-      filter(humvar != 'ref')
-    
   }
   
   # Calculate log2_delta_t
@@ -514,22 +511,11 @@ run_ash = function(df, n_categories, mean_col, se_col,
       
       if (category == 'Total loss'){
         
-        # Find the mode
-        tmp_data = tmp_df[,mean_col]
-        density_est = density(tmp_data)
-        mode = density_est$x[which.max(density_est$y)]
-        
         # Run ash 
         ash_results = 
           ash(tmp_df[,mean_col], tmp_df[,se_col],
-              mixcompdist = 'normal', pi_thresh=0,
-              mode=mode)
-        
-      } else if (category == 'Null'){
-      
-        ash_results = 
-          ash(tmp_df[,mean_col], tmp_df[,se_col],
-              mixcompdist = 'normal', pointmass=TRUE, pi_thresh=0)
+              mixcompdist = 'normal', pi_thresh=0, pointmass=TRUE,
+              mode='estimate')
         
       } else {
         
@@ -604,6 +590,10 @@ plot_pre_vs_post_ash_scatter = function(df, beta){
       ylab(expression(paste("Post-ash log"[2]*" "*Delta*" T"))) +
       labs(color = "SE (pre-ash)")
     
+    range = range(df$pw_mean_log2_delta_t)
+    pB = pA + ylim(range)
+    
+    print(pB)
   } 
   
   print(pA)
@@ -751,10 +741,17 @@ leave_one_out_validation = function(df, beta, rep_4_colname){
   
   df_4replicates = df
   
-  df_3replicates = calculate_prec_mean_and_se_3replicates(df, beta)
+  df_3replicates = calculate_prec_mean_and_se_3replicates(df, 'diploid')
   df_3replicates = run_ash(df_3replicates, n_categories=4, 
                            'pw_mean_3reps', 'pw_se_3reps',
                            'ash_posterior_mean_3reps', 'ash_posterior_sd_3reps')
+  
+  if (beta == 'delta_t'){
+   
+    df_3replicates = transform_diploid_to_haploid(df_3replicates,
+                                                  'ash_posterior_mean_3reps',
+                                                  'ash_posterior_sd_3reps', all_reps=FALSE)
+  }
   
   df_validate = merge(df_4replicates %>%
                         rename(replicate_4 = rep_4_colname) %>%
@@ -770,9 +767,9 @@ leave_one_out_validation = function(df, beta, rep_4_colname){
     mutate(bins = ntile(ash_posterior_mean_3reps, 100)) %>%
     
     group_by(bins) %>%
-    mutate(mean_ash_posterior_3reps = mean(ash_posterior_mean_3reps),
-           mean_replicate_4 = mean(replicate_4),
-           mean_3reps = mean(simple_mean_3reps)) %>%
+    mutate(mean_ash_posterior_3reps = 2^mean(ash_posterior_mean_3reps),
+           mean_replicate_4 = 2^mean(replicate_4),
+           mean_3reps = 2^mean(simple_mean_3reps)) %>%
     ungroup()
   
   mse1 = mean((df_validate$mean_ash_posterior_3reps - 
@@ -781,6 +778,10 @@ leave_one_out_validation = function(df, beta, rep_4_colname){
   mse2 = mean((df_validate$mean_3reps - 
                  df_validate$mean_replicate_4)^2)
   
+  range = range(c(df_validate$mean_ash_posterior_3reps, 
+                  df_validate$mean_3reps,
+                  df_validate$mean_replicate_4))
+
   pA = ggplot(df_validate, aes(x=mean_ash_posterior_3reps, y=mean_replicate_4)) +
     geom_point() + geom_abline(slope=1) +
     ggtitle(str_interp("MSE = ${round(mse1, 4)}")) +
@@ -789,7 +790,8 @@ leave_one_out_validation = function(df, beta, rep_4_colname){
           axis.title = element_text(size=14),
           plot.title = element_text(size=16, face='bold', hjust=0.5)) +
     xlab("Mean ash posterior (3 replicates)") +
-    ylab("Mean replicate 4")
+    ylab("Mean replicate 4") +
+    xlim(range) + ylim(range)
   
   pB = ggplot(df_validate, aes(x=mean_3reps, y=mean_replicate_4)) +
     geom_point() + geom_abline(slope=1) +
@@ -799,7 +801,8 @@ leave_one_out_validation = function(df, beta, rep_4_colname){
           axis.title = element_text(size=14),
           plot.title = element_text(size=16, face='bold', hjust=0.5)) +
     xlab("Mean simple mean (3 replicates)") +
-    ylab("Mean replicate 4")
+    ylab("Mean replicate 4") +
+    xlim(range) + ylim(range)
   
   gridExtra::grid.arrange(pA, pB, nrow=1)
   
@@ -810,9 +813,9 @@ leave_one_out_validation = function(df, beta, rep_4_colname){
 # SPECIFICATIONS  #
 #-----------------#
 read_filter_spec = 0
-epsilon_spec = 0.001
+epsilon_spec = 1
 normalization_spec = 'rpm'
-reference_spec = 'median'
+reference_spec = 'reference'
 remove_input_0_spec = TRUE
 
 
@@ -896,8 +899,8 @@ df = calculate_SE_diploid(df)
 df = calculate_SE_delta(df)
 
 # QC plots
-plot_mean_expected_pulldown_vs_SE(df, 'diploid')
-plot_mean_expected_pulldown_vs_SE(df, 'delta_t')
+# plot_mean_expected_pulldown_vs_SE(df, 'diploid')
+# plot_mean_expected_pulldown_vs_SE(df, 'delta_t')
 
 # 8. Calculate precision-weighted mean and SE 
 df = calculate_prec_mean_and_se_diploid(df)
@@ -908,11 +911,58 @@ df = run_ash(df, n_categories=4,
              'pw_mean_log2_diploid', 'pw_se_log2_diploid',
              'ash_posterior_mean_log2_diploid', 'ash_posterior_se_log2_diploid')
 
-df = run_ash(df, n_categories=4,
-             'pw_mean_log2_delta_t', 'pw_se_log2_delta_t',
-             'ash_posterior_mean_log2_delta_t', 'ash_posterior_se_log2_delta_t')
+# df = run_ash(df, n_categories=4,
+#             'pw_mean_log2_delta_t', 'pw_se_log2_delta_t',
+#             'ash_posterior_mean_log2_delta_t', 'ash_posterior_se_log2_delta_t')
 
 sumstats_df = add_sumstat(df, sumstats_df, "Remove variants with missing predicted category")
+
+# 10. Transform diploid back to log2 delta
+transform_diploid_to_haploid = function(df, 
+                                        ash_diploid_mean_colname, 
+                                        ash_diploid_se_colname, all_reps){
+  
+  df = df %>%
+    
+    rename(diploid=ash_diploid_mean_colname,
+           diploid_se=ash_diploid_se_colname) %>%
+
+    rowwise() %>% 
+    
+    # Naive transformation of diploid to haploid  
+    mutate(naive_haploid = log2((2^diploid-1)*2 + 1),
+           
+           # Second derivative of naive transformation 
+           d2_dx2_haploid = - (2^(diploid+1)*log(2)) / ((2^(diploid+1)-1)^2),
+           
+           # Transformation
+           haploid = naive_haploid + 0.5*d2_dx2_haploid*(diploid^2 + diploid_se))
+  
+  if (all_reps){
+    
+    # Rename back to ash_posterior_mean_log2_delta_t so it's compatible with 
+    # downstream functions
+    df = df %>%
+      rename(ash_posterior_mean_log2_delta_t='haploid',
+             
+             # Rename diploid colnames back 
+             ash_posterior_mean_log2_diploid='diploid',
+             ash_posterior_se_log2_diploid='diploid_se')
+    
+  } else {
+    
+    df = df %>%
+      rename(ash_posterior_mean_3reps='haploid')
+  }
+           
+  return(df)
+  
+  
+}
+
+df = transform_diploid_to_haploid(df, 
+                                  'ash_posterior_mean_log2_diploid',
+                                  'ash_posterior_se_log2_diploid', all_reps=TRUE)
 
 # 10. Save data
 write.csv(df, './data/processed/humvar_5utr_ntrap_v6_ash.csv', row.names=FALSE)
@@ -933,5 +983,3 @@ plot_pre_and_post_ash_distributions(df, 'delta_t')
 #---------------------------#
 leave_one_out_validation(df, 'diploid', 'log2_diploid_fc4')
 leave_one_out_validation(df, 'delta_t', 'log2_delta_t4')
-
-
