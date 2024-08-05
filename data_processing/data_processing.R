@@ -9,10 +9,22 @@ library(stringr)
 library(plotrix)
 library(devtools)
 library(ashr)
+library(nnls)
 library(viridis)
 library(DescTools)
 
 setwd('~/Desktop/5prime_utr/')
+
+
+#-----------------#
+# SPECIFICATIONS  #
+#-----------------#
+read_filter_spec = 0
+epsilon_spec = 0
+normalization_spec = 'rpm'
+reference_spec = 'median'
+remove_input_0_spec = TRUE
+remove_median_0_spec = TRUE
 
 
 #------------#
@@ -36,13 +48,10 @@ keep_relevant_cols_from_df_categories = function(df_categories_raw){
   
   df_categories = df_categories_raw %>%
     rowwise() %>%
-    mutate(humvar = paste(Chr, Position, Ref, Alt, sep='-')) %>%
-    ungroup() %>%
-    rename(predicted_category3 = 'predicted_category') %>%
-    mutate(predicted_category4 = 
-             ifelse(variant_type %in% c('Complete loss of ORFs'),
-                    'Total loss', predicted_category3)) %>%
-    select(humvar, predicted_category3, predicted_category4)
+    rename(predicted_category = 'predicted_category') %>%
+    select(gene_id, humvar, 
+           variant_type,
+           ref_seq, insert_seq, predicted_category)
   
   return(df_categories)
 }
@@ -56,10 +65,16 @@ read_filter = function(df, n_min_reads){
     mutate(min_reads_input = min(input_12h_B1, input_12h_B2,
                                  input_12h_B3, input_12h_B4),
            min_reads_pulldown = min(pulldown_12h_B1, pulldown_12h_B2,
-                                    pulldown_12h_B3, pulldown_12h_B4)) %>%
-    filter(min_reads_input >= n_min_reads | min_reads_pulldown >= n_min_reads) %>%
-    ungroup()
-           
+                                    pulldown_12h_B3, pulldown_12h_B4))
+  
+  if (n_min_reads >= 0){
+    
+    df = df %>%
+      filter(min_reads_input >= n_min_reads | min_reads_pulldown >= n_min_reads) %>%
+      ungroup()
+    
+  } 
+  
   return(df)
   
 }
@@ -71,6 +86,36 @@ remove_reporters_with_any_zeros = function(df){
                                 input_12h_B3 == 0 | input_12h_B4 == 0, 1, 0)) %>%
     filter(to_remove == 0) %>%
     select(-to_remove)
+  
+  return(df)
+  
+}
+
+remove_genes_with_0_median = function(df){
+  
+  # Calculate translation
+  df = df %>%
+    mutate(translation1 = pulldown_12h_B1/input_12h_B1,
+           translation2 = pulldown_12h_B2/input_12h_B2,
+           translation3 = pulldown_12h_B3/input_12h_B3,
+           translation4 = pulldown_12h_B4/input_12h_B4)
+  
+  # Calculate median 
+  df = df %>%
+    group_by(gene) %>%
+    
+    # Compute median translation 
+    mutate(median1 = median(translation1),
+           median2 = median(translation2),
+           median3 = median(translation3),
+           median4 = median(translation4)) %>%
+    
+    ungroup() %>%
+    
+    filter(median1 != 0,
+           median2 != 0,
+           median3 != 0,
+           median4 != 0)
   
   return(df)
   
@@ -163,16 +208,15 @@ calculate_delta_translation = function(df, reference_txt){
     ungroup()
   
   if (reference_txt == 'median'){
-
+    
     # Calculate delta translation 
     df = df %>%
       mutate(delta_t1 = (translation1/median1),
              delta_t2 = (translation2/median2),
              delta_t3 = (translation3/median3),
              delta_t4 = (translation4/median4)) %>%
-      
       filter(humvar != 'ref')
-        
+    
   } else if (reference_txt == 'reference'){
     
     df_refs = df %>%
@@ -183,9 +227,19 @@ calculate_delta_translation = function(df, reference_txt){
              ref3 = 'translation3',
              ref4 = 'translation4')
     
-    df = merge(df, df_refs, by='gene')
+    df = df %>%
+      filter(humvar != 'ref')
+    
+    genes_without_refs = df$gene[!(df$gene %in% df_refs$gene)]
+    n_vars_affected = length(genes_without_refs)
+    
+    print(str_interp("${n_vars_affected} variants removed due to missing reference."))
+    
+    df = merge(df, df_refs, by='gene', all.x=TRUE, all.y=FALSE)
     
     df = df %>%
+      
+      filter(!(gene %in% genes_without_refs)) %>%
       
       # Calculate delta translation 
       mutate(delta_t1 = (translation1/ref1),
@@ -194,7 +248,7 @@ calculate_delta_translation = function(df, reference_txt){
              delta_t4 = (translation4/ref4)) %>%
       
       select(-ref1, -ref2, -ref3, -ref4)
-      
+    
   }
   
   # Calculate log2_delta_t
@@ -236,164 +290,127 @@ calculate_fold_changes = function(df){
   
 }
 
+calculate_expected_pulldown = function(df){
+  # Bin variants based on mean expected pulldown  
+  df = df %>%
+    
+    # Calculate expected pulldown
+    mutate(expected_pulldown_1 = input_12h_B1_norm*median1,
+           expected_pulldown_2 = input_12h_B2_norm*median2,
+           expected_pulldown_3 = input_12h_B3_norm*median3,
+           expected_pulldown_4 = input_12h_B4_norm*median4) %>%
+    
+    ungroup()
+  
+  return(df)
+}
 
 # Calculate SEs 
-solve_for_se_values = function(var_diffs) {
+get_design_matrix <- function(x, num_bins) {
+  n <- nrow(x)
+  p <- ncol(x)
   
-  var_values = solve(coef_matrix, var_diffs)
-  se_values = sqrt(var_values)
+  # Compute the bin edges based on quantiles
+  x_bin <- quantile(array(unlist(x)),
+                    probs = seq(0, 1,
+                                length.out = num_bins + 1
+                    )
+  )[-(num_bins + 1)]
   
-  return(se_values)
+  # Digitize x based on the computed bin edges
+  bins <- matrix(findInterval(array(unlist(x)), x_bin, left.open = TRUE), n, p)
   
+  # Initialize the one-hot encoding vector, v
+  v <- array(0, dim = c(n, p, num_bins))
+  for (i in 1:n) {
+    for (j in 1:p) {
+      v[i, j, 1:bins[i, j]] <- 1
+    }
+  }
+  
+  # Compute the coefficients for the diagonal and off-diagonal elements
+  diag_coef <- ((p - 1) / p)^2
+  offdiag_coef <- (1 / p)^2
+  
+  # Calculate u: made up of one hot encoding and coefficent matrix
+  u <- array(0, dim = c(n, p, num_bins))
+  for (i in 1:n) {
+    for (k in 1:p) {
+      u[i, k, ] <- (diag_coef - offdiag_coef) *
+        v[i, k, ] + offdiag_coef * colSums(v[i, , ])
+    }
+  }
+  
+  return(list(u = u, v = v))
 }
 
-calculate_SE_diploid = function(df){
-
-  # Bin variants based on mean expected pulldown  
-  df = df %>%
-    
-    # Calculate expected pulldown
-    mutate(expected_pulldown_1 = input_12h_B1_norm*median1,
-           expected_pulldown_2 = input_12h_B2_norm*median2,
-           expected_pulldown_3 = input_12h_B3_norm*median3,
-           expected_pulldown_4 = input_12h_B4_norm*median4) %>%
-    
-    rowwise() %>%
-    
-    mutate(mean_expected_pulldown = sum(expected_pulldown_1,
-                                        expected_pulldown_2, 
-                                        expected_pulldown_3,
-                                        expected_pulldown_4)/4) %>%
-    
-    ungroup() %>%
-    
-    # Bin reporters based on expected pulldown 
-    mutate(bins = ntile(mean_expected_pulldown, n_bins)) %>%
-    select(-starts_with("expected_pulldown"))
+# Function to estimate standard error
+estimate_standard_error <- function(y, x, num_bins) {
+  x <- 1 / x
+  n <- nrow(x)
+  p <- ncol(x)
   
+  # Get design matrix
+  design_matrices <- get_design_matrix(x, num_bins)
+  A <- design_matrices$u
+  V <- design_matrices$v
   
-  # Calculate var(diff_[1-4]) within bins
-  df = df %>% 
-    
-    # Calculate var(beta-mean_beta)
-    rowwise() %>%
-    mutate(mean = (log2_diploid_fc1 + log2_diploid_fc2 +
-                     log2_diploid_fc3 + log2_diploid_fc4)/4,
-           
-           diff_1 = log2_diploid_fc1 - mean,
-           diff_2 = log2_diploid_fc2 - mean,
-           diff_3 = log2_diploid_fc3 - mean,
-           diff_4 = log2_diploid_fc4 - mean) %>%
-    
-    ungroup() %>% 
-    group_by(bins) %>%
-    
-    mutate(var_diff_1 = var(diff_1),
-           var_diff_2 = var(diff_2),
-           var_diff_3 = var(diff_3),
-           var_diff_4 = var(diff_4)) %>%
-    
-    ungroup()
+  residuals <- y - matrix(
+    rep(apply(y, 1, mean), ncol(y)),
+    nrow = nrow(y), ncol = ncol(y)
+  )
   
+  A_transposed <- aperm(A, c(3, 2, 1))
+  dims <- dim(A)
+  nrow <- prod(dims[1:2]) # Number of rows to reshape to
+  ncol <- dims[3]
+  A_flat_row_major <- as.vector(A_transposed)
+  A <- matrix(A_flat_row_major, nrow = nrow, ncol = ncol, byrow = TRUE)
+  V_transposed <- aperm(V, c(3, 2, 1))
+  V_flat_row_major <- as.vector(V_transposed)
+  V <- matrix(V_flat_row_major, nrow = nrow, ncol = ncol, byrow = TRUE)
+  residuals <- as.vector(t(residuals))
   
-  # Calculate SE values by solving for the 4 equations:
-  #   var_diff_1 = (3/4)^2*se_1 + 1/(4^2)*(se_2 + se_3 + se_4)
-  #   var_diff_2 = (3/4)^2*se_2 + 1/(4^2)*(se_1 + se_3 + se_4)
-  #   var_diff_3 = (3/4)^2*se_3 + 1/(4^2)*(se_1 + se_2 + se_4)
-  #   var_diff_4 = (3/4)^2*se_4 + 1/(4^2)*(se_1 + se_2 + se_3)
+  # Solve for theta using NNLS
+  nnls_result <- nnls(A, residuals^2)
+  theta <- coef(nnls_result)
   
-  df = df %>%
-    
-    rowwise() %>%
-    mutate(se_log2_diploid = list(solve_for_se_values(c(var_diff_1, var_diff_2, 
-                                                        var_diff_3, var_diff_4)))) %>%
-    unnest_wider(se_log2_diploid, names_sep = "_") %>%
-    ungroup()
-  
-  # Remove unnecessary columns 
-  df = df %>%
-    select(-bins, -mean, -starts_with("diff"), -starts_with("var_diff"))
-  
-  return(df)
-  
+  return(matrix(V %*% theta, nrow = n, ncol = p, byrow = TRUE))
 }
 
-calculate_SE_delta = function(df){
-  
-  # Bin variants based on mean expected pulldown  
-  df = df %>%
-    
-    # Calculate expected pulldown
-    mutate(expected_pulldown_1 = input_12h_B1_norm*median1,
-           expected_pulldown_2 = input_12h_B2_norm*median2,
-           expected_pulldown_3 = input_12h_B3_norm*median3,
-           expected_pulldown_4 = input_12h_B4_norm*median4) %>%
-    
-    rowwise() %>%
-    
-    mutate(mean_expected_pulldown = sum(expected_pulldown_1,
-                                        expected_pulldown_2, 
-                                        expected_pulldown_3,
-                                        expected_pulldown_4)/4) %>%
-    
-    ungroup() %>%
-    
-    # Bin reporters based on expected pulldown 
-    mutate(bins = ntile(mean_expected_pulldown, n_bins)) %>%
-    select(-starts_with("expected_pulldown"))
-  
-  
-  # Calculate var(diff_[1-4]) within bins
-  df = df %>% 
-    
-    # Calculate var(beta-mean_beta)
-    rowwise() %>%
-    mutate(mean = (log2_delta_t1 + log2_delta_t2 +
-                     log2_delta_t3 + log2_delta_t4)/4,
-           
-           diff_1 = log2_delta_t1 - mean,
-           diff_2 = log2_delta_t2 - mean,
-           diff_3 = log2_delta_t3 - mean,
-           diff_4 = log2_delta_t4 - mean) %>%
-    
-    ungroup() %>% 
-    group_by(bins) %>%
-    
-    mutate(var_diff_1 = var(diff_1),
-           var_diff_2 = var(diff_2),
-           var_diff_3 = var(diff_3),
-           var_diff_4 = var(diff_4)) %>%
-    
-    ungroup()
-  
-  
-  # Calculate SE values by solving for the 4 equations:
-  #   var_diff_1 = (3/4)^2*se_1 + 1/(4^2)*(se_2 + se_3 + se_4)
-  #   var_diff_2 = (3/4)^2*se_2 + 1/(4^2)*(se_1 + se_3 + se_4)
-  #   var_diff_3 = (3/4)^2*se_3 + 1/(4^2)*(se_1 + se_2 + se_4)
-  #   var_diff_4 = (3/4)^2*se_4 + 1/(4^2)*(se_1 + se_2 + se_3)
-  
-  df = df %>%
-    
-    rowwise() %>%
-    mutate(se_log2_delta_t = list(solve_for_se_values(c(var_diff_1, var_diff_2,
-                                                      var_diff_3, var_diff_4)))) %>%
-    unnest_wider(se_log2_delta_t, names_sep = "") %>%
-    ungroup()
-  
-  # Remove unnecessary columns 
-  df = df %>%
-    select(-bins, -mean, -starts_with("diff"), -starts_with("var_diff"))
+# Adds estimated standard error to dataframe
+calculate_se <- function(df, num_bins) {
+  x <- as.matrix(
+    df[c(
+      "expected_pulldown_1", "expected_pulldown_2",
+      "expected_pulldown_3", "expected_pulldown_4"
+    )]
+  )
+  y <- as.matrix(
+    df[c(
+      "log2_diploid_fc1", "log2_diploid_fc2",
+      "log2_diploid_fc3", "log2_diploid_fc4"
+    )]
+  )
+  estimated_error <- sqrt(estimate_standard_error(y, x, num_bins))
+  stopifnot(all(estimated_error >= 0))
+  df_combined <- cbind(df, estimated_error)
+  colnames(df_combined)[
+    (ncol(df) + 1):ncol(df_combined)
+  ] <- c(
+    "se_log2_diploid_1", "se_log2_diploid_2",
+    "se_log2_diploid_3", "se_log2_diploid_4"
+  )
+  df <- df_combined
   
   return(df)
-  
 }
 
 # SE QC plots
 plot_mean_expected_pulldown_vs_SE = function(df, beta_variable){
-  
+
   if (beta_variable == 'diploid'){
-    
+  
     pA = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_diploid_1)) + 
       geom_point() + theme_light()
     pB = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_diploid_2)) + 
@@ -500,16 +517,16 @@ run_ash = function(df, n_categories, mean_col, se_col,
   } else if (n_categories == 4){
     
     # Categories 
-    categories = unique(na.omit(df$predicted_category4))
+    categories = unique(na.omit(df$predicted_category))
     
     # Run ash within each category 
     for (category in categories){
       
       # Subset variants in category 
       tmp_df = df %>%
-        filter(predicted_category4 == category)
+        filter(predicted_category == category)
       
-      if (category == 'Total loss'){
+      if (category %in% c('Total loss')){
         
         # Run ash 
         ash_results = 
@@ -551,12 +568,12 @@ plot_pre_vs_post_ash_scatter = function(df, beta){
   if (beta == 'diploid'){
     
     pA = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=pw_mean_log2_diploid, y=ash_posterior_mean_log2_diploid, 
                     color=pw_se_log2_diploid)) +
       geom_abline(intercept = 0, slope = 1, linetype='dashed', color='grey') +
       geom_point(alpha=0.5) + 
-      facet_wrap(~predicted_category4, nrow=1) +
+      facet_wrap(~predicted_category, nrow=1) +
       theme_light() +
       theme(axis.text = element_text(size=14),
             axis.title = element_text(size=14),
@@ -572,12 +589,12 @@ plot_pre_vs_post_ash_scatter = function(df, beta){
   } else if (beta == 'delta_t'){
     
     pA = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=pw_mean_log2_delta_t, y=ash_posterior_mean_log2_delta_t, 
                     color=pw_se_log2_delta_t)) +
       geom_abline(intercept = 0, slope = 1, linetype='dashed', color='grey') +
       geom_point(alpha=0.5) + 
-      facet_wrap(~predicted_category4, nrow=1) +
+      facet_wrap(~predicted_category, nrow=1) +
       theme_light() +
       theme(axis.text = element_text(size=14),
             axis.title = element_text(size=14),
@@ -605,10 +622,10 @@ plot_pre_and_post_ash_distributions = function(df, beta){
   if (beta == 'diploid'){
     
     pA = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=pw_mean_log2_diploid)) +
       geom_density() + 
-      facet_wrap(~predicted_category4, nrow=1, scales='free') +
+      facet_wrap(~predicted_category, nrow=1, scales='free') +
       theme_light() +
       theme(axis.text = element_text(size=12),
             axis.title = element_text(size=12),
@@ -621,10 +638,10 @@ plot_pre_and_post_ash_distributions = function(df, beta){
       xlab(expression(paste("Precision-weighted mean log"[2]*"(diploid FC)")))
     
     pB = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=ash_posterior_mean_log2_diploid)) +
       geom_density() + 
-      facet_wrap(~predicted_category4, nrow=1, scales='free') +
+      facet_wrap(~predicted_category, nrow=1, scales='free') +
       theme_light() +
       theme(axis.text = element_text(size=12),
             axis.title = element_text(size=12),
@@ -641,10 +658,10 @@ plot_pre_and_post_ash_distributions = function(df, beta){
   } else if (beta == 'delta_t'){
     
     pA = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=pw_mean_log2_delta_t)) +
       geom_density() + 
-      facet_wrap(~predicted_category4, nrow=1, scales='free') +
+      facet_wrap(~predicted_category, nrow=1, scales='free') +
       theme_light() +
       theme(axis.text = element_text(size=12),
             axis.title = element_text(size=12),
@@ -657,10 +674,10 @@ plot_pre_and_post_ash_distributions = function(df, beta){
       xlab(expression(paste("Precision-weighted mean log"[2]*" "*Delta*" T")))
     
     pB = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=ash_posterior_mean_log2_delta_t)) +
       geom_density() + 
-      facet_wrap(~predicted_category4, nrow=1, scales='free') +
+      facet_wrap(~predicted_category, nrow=1, scales='free') +
       theme_light() +
       theme(axis.text = element_text(size=12),
             axis.title = element_text(size=12),
@@ -809,26 +826,10 @@ leave_one_out_validation = function(df, beta, rep_4_colname){
 }
 
 
-#-----------------#
-# SPECIFICATIONS  #
-#-----------------#
-read_filter_spec = 0
-epsilon_spec = 1
-normalization_spec = 'rpm'
-reference_spec = 'reference'
-remove_input_0_spec = TRUE
-
-
 #------------#
 # VARIABLES  #
 #------------#
 n_bins = 100
-
-coef_matrix = matrix(c(9/16, 1/16, 1/16, 1/16,
-                       1/16, 9/16, 1/16, 1/16,
-                       1/16, 1/16, 9/16, 1/16,
-                       1/16, 1/16, 1/16, 9/16), nrow=4, byrow=TRUE)
-
 
 #----------------------#
 # LOAD & PROCESS DATA  #
@@ -846,7 +847,9 @@ df_categories_raw = read.csv('./data/processed/annotated_variants_90k.csv')
 df_categories = keep_relevant_cols_from_df_categories(df_categories_raw)
 
 # Merge NaP-TRAP and categories
-df = merge(df, df_categories, by='humvar', all.x=TRUE, all.y=FALSE)
+df = merge(df, df_categories, 
+           by.x=c('gene','humvar'), 
+           by.y=c('gene_id', 'humvar'), all.x=TRUE, all.y=FALSE)
 
 
 #-------------------#
@@ -878,35 +881,52 @@ if (remove_input_0_spec){
                             str_interp("0 input in any of the 4 replicates"))
 }
 
-# 4. Add epsilon to all input and pulldown 
+# 4. Remove genes with median = 0
+if (remove_median_0_spec){
+  df = remove_genes_with_0_median(df)
+  sumstats_df = add_sumstat(df, sumstats_df, "Remove genes with 0 median")
+}
+
+# 5. Add epsilon to all input and pulldown 
 df = add_epsilon(df, epsilon_spec)
 
-# 5. Normalize (RPM or spikein)
-df = normalize_replicates(df, normalization_spec)
+# 6. Normalize (RPM or spikein)
+df = normalize_replicates(df, normalization_spec, df_spikeins)
 
-# 4. Calculate translation values as pulldown/input
+# 7. Calculate translation values as pulldown/input
 df = calculate_translation(df)
  
-# 5. Calculate delta translation (based on median or reference)
+# 8. Calculate delta translation (based on median or reference)
 df = calculate_delta_translation(df, reference_spec)
 sumstats_df = add_sumstat(df, sumstats_df, "Remove reference reporters")
 
-# 6. Calculate fold changes
+
+if (reference_spec == 'median'){
+  sumstats_df = add_sumstat(df, sumstats_df, "Remove reference reporters")
+} else {
+  sumstats_df = add_sumstat(df, sumstats_df, "Remove reference reporters and variants without ref")
+}
+
+# 9. Remove variants w/o predicted category 
+df = df %>% filter(is.na(predicted_category) == FALSE)
+sumstats_df = add_sumstat(df, sumstats_df, 
+                          "Remove variants w/o predicted category (NFASC tiling, missing references)")
+
+# 10. Calculate fold changes
 df = calculate_fold_changes(df)
 
-# 7. Calculate SE based on bins of expected pulldown
-df = calculate_SE_diploid(df)
-df = calculate_SE_delta(df)
+# 11. Calculate SE based on bins of expected pulldown
+df = calculate_expected_pulldown(df)
+df = calculate_se(df, n_bins)
 
 # QC plots
 # plot_mean_expected_pulldown_vs_SE(df, 'diploid')
 # plot_mean_expected_pulldown_vs_SE(df, 'delta_t')
 
-# 8. Calculate precision-weighted mean and SE 
+# 12. Calculate precision-weighted mean and SE 
 df = calculate_prec_mean_and_se_diploid(df)
-df = calculate_prec_mean_and_se_delta_t(df)
 
-# 9. Ash
+# 13. Ash
 df = run_ash(df, n_categories=4, 
              'pw_mean_log2_diploid', 'pw_se_log2_diploid',
              'ash_posterior_mean_log2_diploid', 'ash_posterior_se_log2_diploid')
@@ -917,7 +937,7 @@ df = run_ash(df, n_categories=4,
 
 sumstats_df = add_sumstat(df, sumstats_df, "Remove variants with missing predicted category")
 
-# 10. Transform diploid back to log2 delta
+# 14. Transform diploid back to log2 delta
 transform_diploid_to_haploid = function(df, 
                                         ash_diploid_mean_colname, 
                                         ash_diploid_se_colname, all_reps){
@@ -964,8 +984,8 @@ df = transform_diploid_to_haploid(df,
                                   'ash_posterior_mean_log2_diploid',
                                   'ash_posterior_se_log2_diploid', all_reps=TRUE)
 
-# 10. Save data
-write.csv(df, './data/processed/humvar_5utr_ntrap_v6_ash.csv', row.names=FALSE)
+# 15. Save data
+write.csv(df, '../data/humvar_5utr_ntrap_v6_ash_wohns_beta.csv', row.names=FALSE)
 
 
 #-------------------------------------#
