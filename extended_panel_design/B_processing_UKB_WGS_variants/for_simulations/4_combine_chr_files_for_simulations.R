@@ -88,6 +88,8 @@ for (i in c(1:22, 'X')){
     print(paste("File does not exist for i =", i))
   }
 
+	print(i)
+
 }
 
 write.csv(invar_df, "./processed/UKB_invariant_variants_annotated_preliminary_panel.csv",
@@ -126,4 +128,4 @@ sumstats = sumstats_df %>%
   mutate(Variants_lost = After_total - Before_total)
 
 write.csv(sumstats, "./processed/filtering_invariant_sumstats_preliminary_panel.csv",
-          row.names=FALSE)
+         row.names=FALSE)
