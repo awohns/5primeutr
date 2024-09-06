@@ -28,8 +28,7 @@ import pandas as pd
 import pickle
 import re
 import scipy.stats as stats
-import math
-import warnings
+from scipy.stats import norm
 
 from tqdm import tqdm
 
@@ -162,18 +161,22 @@ class Likelihoods:
         # make a list of the sample sizes in the likelihoods
         self.sample_size_keys = np.array(list(self.likelihoods.keys()))
 
-    def load(self, normalize=True):
+    def load(self, progress=False, normalize=True):
         """
         Loads the likelihoods pickle file computed using dtwf.
         """
+        self.normalized = normalize
         if type(self.likelihoods_path) is dict:
             self.likelihoods = {}
+            self.normalization_constants = {}
             for sample_size, path in self.likelihoods_path.items():
                 with open(path, "rb") as handle:
                     self.likelihoods[sample_size] = pickle.load(handle)
                 if normalize:
                     lls_dict_normalized = {}
-                    for key, val in tqdm(self.likelihoods[sample_size].items()):
+                    for key, val in tqdm(
+                        self.likelihoods[sample_size].items(), disable=not progress
+                    ):
                         # for col in range(val.shape[1]):
                         # Remove the row of frequency = 0
                         ll_curves_modified = val[1:-1, :-1]
@@ -185,13 +188,42 @@ class Likelihoods:
                         ll_curves_modified = ll_curves_modified / column_sums
                         lls_dict_normalized[key] = ll_curves_modified
                     self.likelihoods[sample_size] = lls_dict_normalized
+                else:
+                    normalization_constants = {}
+                    for key, val in tqdm(
+                        self.likelihoods[sample_size].items(), disable=not progress
+                    ):
+                        # for col in range(val.shape[1]):
+                        # Remove the row of frequency = 0
+                        ll_curves_modified = val[1:, :]
+
+                        # Calculate the sum of each column
+                        column_sums = ll_curves_modified.sum(axis=0)
+
+                        normalization_constants[key] = column_sums
+                    self.normalization_constants[sample_size] = normalization_constants
+                # else:
+                #     # Remove last column
+                #     lls_dict_remove_last_col = {}
+                #     for key, val in tqdm(
+                #         self.likelihoods[sample_size].items(), disable=not progress
+                #     ):  
+                #         ll_curves_modified = val[0:-1, :-1]
+
+                #         # Calculate the sum of each column
+                #         column_sums = ll_curves_modified.sum(axis=0)
+
+                #         # Normalize each column so they sum to 1
+                #         ll_curves_modified = ll_curves_modified / column_sums
+                #         lls_dict_remove_last_col[key] = ll_curves_modified
+                #     self.likelihoods[sample_size] = lls_dict_remove_last_col
             self.check_consistency()
         else:
             with open(self.likelihoods_path, "rb") as handle:
                 self.likelihoods = pickle.load(handle)
             if normalize:
                 lls_dict_normalized = {}
-                for key, val in tqdm(self.likelihoods.items()):
+                for key, val in tqdm(self.likelihoods.items(), disable=not progress):
                     # for col in range(val.shape[1]):
                     # Remove the row of frequency = 0
                     ll_curves_modified = val[1:-1, :-1]
@@ -203,6 +235,32 @@ class Likelihoods:
                     ll_curves_modified = ll_curves_modified / column_sums
                     lls_dict_normalized[key] = ll_curves_modified
                 self.likelihoods = lls_dict_normalized
+            else:
+                normalization_constants = {}
+                for key, val in tqdm(
+                    self.likelihoods.items(), disable=not progress
+                ):
+                    # for col in range(val.shape[1]):
+                    # Remove the row of frequency = 0
+                    ll_curves_modified = val[1:, :]
+
+                    # Calculate the sum of each column
+                    column_sums = ll_curves_modified.sum(axis=0)
+
+                    normalization_constants[key] = column_sums
+                self.normalization_constants = normalization_constants
+            # else:
+            #     lls_dict_remove_last_col = {}
+            #     for key, val in tqdm(self.likelihoods.items(), disable=not progress):
+            #         ll_curves_modified = val[0:-1, :-1]
+
+            #         # Calculate the sum of each column
+            #         column_sums = ll_curves_modified.sum(axis=0)
+
+            #         # Normalize each column so they sum to 1
+            #         ll_curves_modified = ll_curves_modified / column_sums
+            #         lls_dict_remove_last_col[key] = ll_curves_modified
+            #     self.likelihoods = lls_dict_remove_last_col
 
             self.check_consistency()
 
@@ -261,7 +319,7 @@ class Likelihoods:
         """
         # If the context for the variant is in the likelihoods there's no need for interpolation
         if context in self.ll_contexts:
-            return self.likelihoods[closest_sample_size][context]
+            return (closest_sample_size, context)
 
         if "X" in context:
             mutation_df = self.ll_mutation_rates_df_X
@@ -271,108 +329,150 @@ class Likelihoods:
             closest_context = mutation_df.loc[
                 mutation_df["mu_snp"].idxmax(), "full_context"
             ]
-            return self.likelihoods[closest_sample_size][closest_context]
+            return (closest_sample_size, closest_context)
         if mu_snp > np.max(mutation_df["mu_snp"]):
             closest_context = mutation_df.loc[
                 mutation_df["mu_snp"].idxmax(), "full_context"
             ]
-            return self.likelihoods[closest_sample_size][closest_context]
+            return (closest_sample_size, closest_context)
 
         # Compute distances and find the two closest contexts
         distances = np.abs(mu_snp - mutation_df["mu_snp"].values)
         sorted_indices = np.argsort(distances)
         context = mutation_df.iloc[sorted_indices[0]]["full_context"]
-        curve = self.likelihoods[closest_sample_size][context]
+        # curve = self.likelihoods[closest_sample_size][context]
 
-        return curve
+        return (closest_sample_size, context)
 
-    def create_ll_cache(self, contexts, cur_q):
+    def closest_context(self, context):
+        """
+        If the trinucleotide context of a variant does not appear in the likelihood table,
+        choose the closest contexts.
+        """
+        if context in self.ll_contexts:
+            return context
+        if "X" in context:
+            mutation_df = self.ll_mutation_rates_df_X
+        else:
+            mutation_df = self.ll_mutation_rates_df_autosomes
+        mu_snp = self.mutation_rates_df[
+            self.mutation_rates_df.full_context_nochrom == context[:-1]
+        ]["mu_snp"].values
+        assert mu_snp.shape[0] == 1
+        if mu_snp < np.min(mutation_df["mu_snp"]):
+            closest_context = mutation_df.loc[
+                mutation_df["mu_snp"].idxmax(), "full_context"
+            ]
+            return closest_context
+        if mu_snp > np.max(mutation_df["mu_snp"]):
+            closest_context = mutation_df.loc[
+                mutation_df["mu_snp"].idxmax(), "full_context"
+            ]
+            return closest_context
+
+        # Compute distances and find the two closest contexts
+        distances = np.abs(mu_snp - mutation_df["mu_snp"].values)
+        sorted_indices = np.argsort(distances)
+        closest_context = mutation_df.iloc[sorted_indices[0]]["full_context"]
+
+        return closest_context
+
+    def prior_s(self, c_value):
+        self.all_beta_ranges = []
+        self.all_weights = []
+
+        # Precompute beta ranges for all unique combinations
+        for s_het, beta in zip(self.cur_s_het, self.betas):
+            pos_beta_range = np.sqrt(self.S_GRID / (s_het * c_value))
+            neg_beta_range = -np.sqrt(self.S_GRID / (s_het * c_value))
+            self.all_beta_ranges.append(np.concatenate([np.flip(neg_beta_range), pos_beta_range]))
+            # self.all_beta_ranges.append(np.sort(beta_range))
+        self.all_beta_ranges = np.array(self.all_beta_ranges)
+        loc = np.expand_dims(self.betas, axis=-1)  # Shape becomes (80330, 1)
+        scale = np.expand_dims(self.cur_sds, axis=-1)  # Shape becomes (80330, 1)
+        self.all_weights = norm.pdf(self.all_beta_ranges, loc=loc, scale=scale)
+
+        # For rows where SD is close to 0, assign all weight to closest value
+        sd_zero = np.isclose(self.cur_sds, 0)
+        self.all_weights[sd_zero] = np.zeros_like(self.all_weights[sd_zero])
+        expanded_betas = self.betas[sd_zero][:, np.newaxis]
+        min_indices = np.argmin(np.abs(expanded_betas - self.all_beta_ranges[sd_zero]), axis=1)
+        self.all_weights[sd_zero, min_indices] = 1
+
+        assert ~np.any(np.isnan(self.all_weights))
+
+    def create_ll_cache(self, closest_contexts, closest_sample_sizes, progress=False):
+        # Precalculate P(S|AF>0) = P(S) * P(AF>0|S) / Constant
         # We need to renormalize the likelihoods by dividing by all nonzero columns
-        self.cache_denominators = {}
-        for context in tqdm(np.unique(contexts)):
-            for sample_size in self.sample_size_keys:
-                if sample_size >= np.max(cur_q):
-                    closest_sample_size = self.sample_size_keys[-1]
-                else:
-                    closest_sample_size = self.sample_size_keys[
-                        np.searchsorted(
-                            self.sample_size_keys,
-                            [
-                                sample_size,
-                            ],
-                            side="right",
-                        )[0]
-                    ]
+        self.cache_denominators = []
+        
+        for index, (closest_context, closest_sample_size) in tqdm(
+            enumerate(zip(closest_contexts, closest_sample_sizes)), disable= not progress):
+            closest_ll = self.likelihoods[int(closest_sample_size)][closest_context]
+            # for closest_s, s_cur in enumerate(self.S_GRID):
+            llhood = self.normalization_constants[closest_sample_size][closest_context]#np.sum(closest_ll[1:, :], axis=0)
+            llhood = np.concatenate([np.flip(llhood), llhood])
+            p_s = self.all_weights[index]
+            numerator = llhood * p_s 
+            self.cache_denominators.append(numerator / np.sum(numerator))
 
-                self.cache_denominators[
-                    context + "_" + str(closest_sample_size)
-                ] = np.zeros_like(self.S_GRID)
-                mut_rate = self.mutation_rates_df[
-                    self.mutation_rates_df.full_context_nochrom == context[:-1]
-                ]["mu_snp"]
-                assert mut_rate.shape[0] == 1
-                closest_ll = self.closest_ll(
-                    context, mut_rate.iloc[0], closest_sample_size
-                )
-                for closest_s, s_cur in enumerate(self.S_GRID):
-                    self.cache_denominators[context + "_" + str(closest_sample_size)][
-                        closest_s
-                    ] = np.sum(closest_ll[1:, closest_s])
+    def compute_posterior_s(self, neutral_prob):
+        self.posterior_s = []
+        self.posterior_s_0 = []
+        for index, (closest_context, closest_sample_size, beta) in enumerate(
+            zip(self.closest_contexts, self.closest_sample_sizes, self.betas)):
+            beta_range = self.all_beta_ranges[index]
+            beta_index = np.argmin(np.abs(beta_range - beta))
+            af_greater_0 = self.normalization_constants[closest_sample_size][closest_context]
+            af_greater_0 = np.concatenate([np.flip(af_greater_0), af_greater_0])
+            posterior_s = (1 - neutral_prob) * af_greater_0[beta_index]
+            posterior_s_0 = neutral_prob * self.normalization_constants[closest_sample_size][closest_context][0]
+            constant = posterior_s + posterior_s_0
+            if constant != 0:
+                self.posterior_s.append(posterior_s/constant)
+                self.posterior_s_0.append(posterior_s_0/constant)
+            else:
+                self.posterior_s.append(0)
+                self.posterior_s_0.append(0)
 
-    def compute_ll(
+
+
+    def load_data(
         self,
-        c,
         sample_sizes,
-        cur_betas,
+        betas,
         cur_sds,
         cur_s_het,
         cur_q,
         contexts,
-        neutral_prob=0,
         progress=False,
-        normalized=False,
     ):
+        """
+        Load the data required to perform inference.
+        Assign contexts and sample sizes to their closest values in Likelihoods.
+        """
         assert np.all(
             np.isclose(
-                cur_betas.shape[0],
+                len(betas),
                 np.array(
                     [
-                        cur_betas.shape[0],
-                        cur_sds.shape[0],
-                        cur_s_het.shape[0],
-                        cur_q.shape[0],
-                        contexts.shape[0],
+                        len(betas),
+                        len(cur_sds),
+                        len(cur_s_het),
+                        len(cur_q),
+                        len(contexts),
                     ]
                 ),
             )
         )
-        self.create_ll_cache(contexts, cur_q)
 
-        cache_beta_range = {}
-        for s_het in np.unique(cur_s_het):
-            # We want to find values of beta that are equivalent to each value in the S_GRID
-            # Given c and shet
-            beta_range = np.sqrt(self.S_GRID / (s_het * c))
-            beta_range = np.concatenate([beta_range[::2], -beta_range[1::2]])
-            beta_range = beta_range[
-                np.argsort(np.abs(beta_range))
-            ]  # beta_range[np.argsort(np.abs(beta_range))]**2*1*cur_s_het[0]
-
-            cache_beta_range[s_het] = beta_range
-
-        total_ll = 0
-
-        for beta, sd, s_het, cur_q, context, sample_size in tqdm(
-            zip(cur_betas, cur_sds, cur_s_het, cur_q, contexts, sample_sizes),
-            disable=not progress,
-        ):
-            if normalized:
-                reference_allele_frequences = np.arange(1, sample_size + 1)
-            else:
-                reference_allele_frequences = np.arange(0, sample_size + 1)
-
-            if sample_size >= np.max(cur_q):
-                closest_sample_size = self.sample_size_keys[-1]
+        self.closest_sample_sizes = []
+        self.closest_contexts = []
+        for index, (context, sample_size) in enumerate(zip(contexts, sample_sizes)):
+            # if sample_size >= np.max(cur_q):
+            # closest_sample_size = self.sample_size_keys[-1]
+            if sample_size in self.sample_size_keys:
+                closest_sample_size = sample_size
             else:
                 closest_sample_size = self.sample_size_keys[
                     np.searchsorted(
@@ -383,118 +483,313 @@ class Likelihoods:
                         side="right",
                     )[0]
                 ]
-            # print("closest", closest_sample_size, sample_size)
-            beta_range = cache_beta_range[s_het]
-            # Calculate weights for each value of beta
-            if ~np.isclose(sd, 0):
-                weights = stats.norm(beta, sd).pdf(beta_range)
-                if np.all(weights == 0):
-                    # if all weights are 0 and the beta is greater than the beta_range
-                    # assign all weight to highest beta_range value
-                    if beta > np.max(beta_range):
-                        weights[np.argmax(beta_range)] = 1
-                    elif beta < np.min(beta_range):
-                        weights[np.argmin(beta_range)] = 1
-                    else:
-                        print(
-                            "Failing beta",
-                            beta,
-                            np.max(beta_range),
-                            sd,
-                            weights,
-                            beta_range,
-                        )
-                        weights[np.argmin(np.abs(beta_range - beta))] = 1
-                        if np.all(weights == 0):
-                            print(
-                                "Failing beta",
-                                beta,
-                                np.max(beta_range),
-                                weights,
-                                beta_range,
-                            )
-                            raise ValueError
+            self.closest_sample_sizes.append(closest_sample_size)
+            self.closest_contexts.append(self.closest_context(context))
 
-                # avoid floating point errors
-                if np.sum(weights) > 1e-300:
-                    weights = weights / np.sum(weights)
-                else:
-                    # Check that all values are 0 except 1
-                    assert np.sum(weights == 0) == (weights.shape[0] - 1), weights
-                    assert weights[np.argmin(np.abs(beta_range - beta))] != 0
-                    weights[np.argmin(np.abs(beta_range - beta))] = 1
-                    print("avoided overflow")
+        # self.create_ll_cache(
+        #     self.closest_contexts, self.closest_sample_sizes, progress=progress
+        # )
+        self.sample_sizes = np.array(sample_sizes)
+        self.betas = np.array(betas)
+        self.cur_sds = np.array(cur_sds)
+        self.cur_s_het = np.array(cur_s_het)
+        self.cur_q = np.array(cur_q)
 
-                assert ~np.any(np.isnan(weights)), weights
-            else:
-                weights = np.zeros_like(beta_range)
-                weights[np.argmin(np.abs(beta - beta_range))] = 1
+        if self.normalized:
+            self.cur_q = self.cur_q.astype(int) - 1
+        else:
+            # if not normalized 
+            self.cur_q = self.cur_q.astype(int)
+        self.contexts = contexts
 
-            # Find the index of the closest frequency in the reference list
-            q_index = np.where(cur_q == reference_allele_frequences)[0][0]
+        self.ll_indices = []
+        self.param_history = []
+        self.likelihood_history = []
 
-            prob = 0
-            denominator = 0
+    def compute_ll(self, params, progress=True):
+        results = []
+        if len(params) == 3:
+            c_positive = params[0]
+            c_negative = params[1]
+            neutral_prob = params[2]
+            separate_cs = True
+        elif len(params) == 2:
+            c = params[0]
+            neutral_prob = params[1]
+            separate_cs = False
+        elif len(params) == 1:
+            c = params[0]
+            neutral_prob = 0
+            separate_cs = False
+        self.prior_s(c) 
+        if not self.normalized:
+            self.create_ll_cache(self.closest_contexts, self.closest_sample_sizes)
+        # # cache_beta_range = {}
+        # # cache_weights = {}
+        # self.all_beta_ranges = []
+        # self.all_weights = []
+        # # combined_array = np.column_stack((self.cur_s_het, self.betas))
+        # # unique_combinations = np.unique(combined_array, axis=0)
 
-            mut_rate = self.mutation_rates_df[
-                self.mutation_rates_df.full_context_nochrom == context[:-1]
-            ]["mu_snp"]
-            assert mut_rate.shape[0] == 1
-            cur_ll_curve = self.closest_ll(
-                context, mut_rate.iloc[0], closest_sample_size
-            )
+        # # Precompute beta ranges for all unique combinations
+        # # for s_het, beta in tqdm(unique_combinations):
+        # for s_het, beta in zip(self.cur_s_het, self.betas):
+        #     if separate_cs:
+        #         c_value = c_positive if beta > 0 else c_negative
+        #     else:
+        #         c_value = c
+        #     beta_range = np.sqrt(self.S_GRID / (s_het * c_value))
+        #     self.all_beta_ranges.append(beta_range)
+        # self.all_beta_ranges = np.array(self.all_beta_ranges)
+        # loc = np.expand_dims(np.abs(self.betas), axis=-1)  # Shape becomes (80330, 1)
+        # scale = np.expand_dims(self.cur_sds, axis=-1)  # Shape becomes (80330, 1)
+        # self.all_weights = norm.pdf(self.all_beta_ranges, loc=loc, scale=scale)
 
-            for closest_s, s_cur in enumerate(self.S_GRID):
-                try:
-                    cur_ll_curve[q_index, closest_s]
-                except:
-                    print(closest_sample_size, q_index, closest_s)
-                if weights[closest_s] != 0 and cur_ll_curve[q_index, closest_s] != 0:
-                    prob += np.exp(
-                        np.log(cur_ll_curve[q_index, closest_s])
-                        + np.log(weights[closest_s])
-                    )
-                    np.seterr(invalid="raise")
-                    denominator += np.exp(
-                        np.log(
-                            self.cache_denominators[
-                                context + "_" + str(closest_sample_size)
-                            ][closest_s]
-                        )
-                        + np.log(weights[closest_s])
-                    )
+        # # CHECK THIS PART
+        # # if all weights are 0 and the beta is greater than the beta_range
+        # # assign all weight to highest beta_range value
+        # zero_rows = np.all(self.all_weights == 0, axis=1)
 
-            if neutral_prob != 0:
-                neutral_ll = cur_ll_curve[q_index, 0]
-                # Normalization: we want the unnormalized probability divided by the normalization
-                numerator = (prob * (1 - neutral_prob)) + (neutral_ll * neutral_prob)
-                denominator = (denominator * (1 - neutral_prob)) + (
-                    self.cache_denominators[context + "_" + str(closest_sample_size)][0]
-                    * neutral_prob
+        # # Expand dimensions to enable broadcasting
+        # expanded_betas = self.betas[zero_rows][:, np.newaxis]
+
+        # # Compute the difference and find the index of the minimum value
+        # min_indices = np.argmin(np.abs(expanded_betas - self.all_beta_ranges[zero_rows]), axis=1)
+
+        # # Assign weight to the closest beta range value
+        # self.all_weights[zero_rows, min_indices] = 1
+
+        # # For rows where SD is close to 0, assign all weight to closest value
+        # sd_zero = np.isclose(self.cur_sds, 0)
+        # self.all_weights[sd_zero] = np.zeros_like(self.all_weights[sd_zero])
+        # expanded_betas = self.betas[sd_zero][:, np.newaxis]
+        # min_indices = np.argmin(np.abs(expanded_betas - self.all_beta_ranges[sd_zero]), axis=1)
+        # self.all_weights[sd_zero, min_indices] = 1
+
+        # # Sum along axis 1 and reshape for broadcasting
+        # weights_sum = np.sum(self.all_weights, axis=1)[:, np.newaxis]
+        
+        # # Normalize weights
+        # self.all_weights = self.all_weights / weights_sum
+        # assert ~np.any(np.isnan(self.all_weights))
+
+        # combined_array = np.column_stack((self.cur_s_het, self.betas, self.cur_sds))
+        # unique_combinations = np.unique(combined_array, axis=0)
+        # for s_het, beta, sd in tqdm(unique_combinations):
+        #     beta_range = cache_beta_range[(s_het, beta)]
+
+        #     if not np.isclose(sd, 0):
+        #         # weights = stats.norm(beta, sd).pdf(beta_range)
+        #         # weights = np.ones_like(beta_range)
+        #         weights = norm.pdf(beta_range, loc=beta, scale=sd)
+        #         if np.all(weights == 0):
+        #             if beta > np.max(beta_range):
+        #                 weights[np.argmax(beta_range)] = 1
+        #             elif beta < np.min(beta_range):
+        #                 weights[np.argmin(beta_range)] = 1
+        #             else:
+        #                 weights[np.argmin(np.abs(beta_range - beta))] = 1
+        #                 if np.all(weights == 0):
+        #                     raise ValueError("Failed to assign weights.")
+
+        #         # if np.sum(weights) > 1e-300:
+        #         #     weights /= np.sum(weights)
+        #         # else:
+        #         #     weights = np.zeros_like(beta_range)
+        #         #     weights[np.argmin(np.abs(beta - beta_range))] = 1
+
+        #         # assert not np.any(np.isnan(weights)), f"Weights contain NaN values: {weights}"
+        #     else:
+        #         weights = np.zeros_like(beta_range)
+        #         weights[np.argmin(np.abs(beta - beta_range))] = 1
+
+        #     cache_weights[(s_het, beta, sd)] = weights
+
+        total_ll = 0
+
+        # Optimization opportunity: iterate through groups of context/sample sizes
+        # Then can look up all the data for each combo at once
+        for index, (beta, sd, s_het, q_index, context, sample_size) in tqdm(
+            enumerate(
+                zip(
+                    self.betas,
+                    self.cur_sds,
+                    self.cur_s_het,
+                    self.cur_q,
+                    self.closest_contexts,
+                    self.closest_sample_sizes,
                 )
-                # The last column (highest s value) has all of its probability mass on singletons.
-                # This means we can have an issue where the probability is 0 and denominator is 0 if the frequency is non-singleton
-                # Hacky fix here is to just add a very small probability
-                if denominator == 0 and prob == 0:
-                    raise ValueError
-                    # total_ll += -np.log(np.nextafter(0, 1))
+            ),
+            disable=not progress,
+        ):
+
+            # if not np.isclose(sd, 0):
+            
+                # ll_dict.cache_denominators contains P(AF>0|s)
+    
+                
+                # prob = np.sum(
+                #     np.exp(
+                #         np.log(self.likelihoods[sample_size][context][q_index])
+                #         + np.log(weights)
+                #     )#[weights != 0]
+                # )
+                # denominator = np.sum(self.cache_denominators[context + "_" + str(sample_size)] * weights)
+                # denominator = denominator / np.sum(denominator)
+                # denominator = np.sum(
+                    # np.exp(
+                        # np.log(
+                            # self.cache_denominators[context + "_" + str(sample_size)]
+                        # )
+                        # + np.log(weights)
+                    # )#[weights != 0]
+                # )
+
+            # else:
+
+                # prob = 0
+                # denominator = 0
+                # cur_ll_curve = self.likelihoods[sample_size][context]
+                # beta_range = self.all_beta_ranges[index]  # [(s_het, beta)]
+                # # print(np.argmin(np.abs((c * s_het * beta ** 2) - self.S_GRID)))
+                # beta_index = np.argmin(np.abs(np.abs(beta) - beta_range))
+
+                # prob = cur_ll_curve[q_index, beta_index]
+                # # print(prob, sample_size, context, q_index, beta_index)                
+                # denominator = self.cache_denominators[context + "_" + str(sample_size)][
+                #     beta_index
+                # ]
+
+                # for closest_s, s_cur in enumerate(self.S_GRID):
+                #     if weights[closest_s] != 0 and cur_ll_curve[q_index, closest_s] != 0:
+                #         prob += np.exp(
+                #             np.log(cur_ll_curve[q_index, closest_s])
+                #             + np.log(weights[closest_s])
+                #         )
+                #         np.seterr(invalid="raise")
+                #         denominator += np.exp(
+                #             np.log(
+                #                 self.cache_denominators[
+                #                     context + "_" + str(closest_sample_size)
+                #                 ][closest_s]
+                #             )
+                #             + np.log(weights[closest_s])
+                #         )
+            if not self.normalized:
+                weights = self.all_weights[index]  # cache_weights[(s_het, beta, sd)]
+                llhood = self.likelihoods[sample_size][context][q_index, :]
+                # Note the likelihoods are determined with a grid of S, but S = c * beta **2 * shet, and we want it in terms of beta, so we have to 
+                # account for positive and negative beta
+                numerator = np.concatenate([np.flip(llhood), llhood])
+                numerator = numerator[1:] #* np.diff(self.all_beta_ranges[index]) * self.all_weights[index][1:]
+                # The denominator is p(AF>0|s)
+                # denominator = np.sum(self.likelihoods[sample_size][context][1:, :], axis=0)
+                denominator = self.normalization_constants[sample_size][context]
+                denominator = np.concatenate([np.flip(denominator), denominator])
+                denominator = denominator[1:] #* np.diff(self.all_beta_ranges[index]) * self.all_weights[index][1:]
+
+                llhood = (numerator/denominator) #* np.diff(self.all_beta_ranges[index])# * self.all_weights[index][1:]
+                # print(numerator, denominator)
+                llhood[np.isnan(llhood)] = 0
+                prob = np.nansum(
+                                (llhood) *
+                                 self.cache_denominators[index][1:])
+            if neutral_prob != 0:
+                neutral_ll = self.likelihoods[sample_size][context][q_index, 0]
+                if self.normalized:
+                    numerator = (prob * (1 - neutral_prob)) + (neutral_ll * neutral_prob)
+                    total_ll += numerator
+                    results.append(numerator)
                 else:
-                    total_ll += -np.log(numerator / denominator + 1e-8)
-                    print(-np.log(numerator / denominator + 1e-8))
-            else:
-                if normalized:
-                    total_ll += -np.log(prob + 1e-8)
-                else:
+                    # Normalization: we want the unnormalized probability divided by the normalization    
+                    # Probability of s = 0 given AF > 0
+                    beta_range = self.all_beta_ranges[index]
+                    norm_constant = self.normalization_constants[sample_size][context]
+                    posterior = ((self.all_weights[index][np.argmin(np.abs(beta_range-0))] * norm_constant[0]) /
+                        np.sum(norm_constant))
+                    neutral = (neutral_ll / norm_constant[0]) #* posterior
+                    # denominator = (denominator * (1 - neutral_prob)) + (
+                        # self.cache_denominators[context + "_" + str(sample_size)][0]
+                        # * neutral_prob
+                    # )
                     # The last column (highest s value) has all of its probability mass on singletons.
                     # This means we can have an issue where the probability is 0 and denominator is 0 if the frequency is non-singleton
                     # Hacky fix here is to just add a very small probability
-                    if denominator == 0 and prob == 0:
-                        continue
+                    # if denominator == 0 and prob == 0:
+                        # raise ValueError
+                        # total_ll += -np.log(np.nextafter(0, 1))
+                    # else:
+                    try:
+                        if -np.log((prob * (1 - neutral_prob)) + neutral) == -np.inf:
+                            # print(prob, neutral, neutral_ll, norm_constant, beta, beta_index)
+                            continue
+                        # print(-np.log(prob * (1 - neutral_prob)) + (neutral * neutral_prob), prob, neutral, neutral_prob)
+                        total_ll += -np.log((prob * (1 - neutral_prob)) + (neutral * neutral_prob))
+                        # total_ll += numerator / denominator
+                        results.append(numerator / denominator)
+                    except FloatingPointError as e:
+                        print(f"Error encountered: {e}")
+                        print(f"Numerator: {numerator}")
+                        print(f"Denominator: {denominator}")
+                        print(c, neutral_prob)
+                        raise  # Re-raise the error after logging the information
+            else:
+                if self.normalized:
+                    # beta_range = self.all_beta_ranges[index]  # [(s_het, beta)]
+                    beta_range = np.sqrt(self.S_GRID / (s_het * c))
+                    beta_index = np.argmin(np.abs(np.abs(beta) - beta_range))
+                    llhood = self.likelihoods[sample_size][context][q_index, beta_index]
+                    # Note the likelihoods are determined with a grid of S, but S = c * beta **2 * shet, and we want it in terms of beta, so we have to 
+                    # account for positive and negative beta
+                    # llhood = np.concatenate([np.flip(llhood), llhood])
+                    # print(c, beta, beta_index, q_index, llhood)
+                    total_ll += -np.log(llhood)  # + 1e-8)
+                    # raise ValueError
+                    # results.append(prob)
+                else:
+                    
+                    # The last column (highest s value) has all of its probability mass on singletons.
+                    # This means we can have an issue where the probability is 0 and denominator is 0 if the frequency is non-singleton
+                    # Hacky fix here is to just add a very small probability
+                    # if denominator == 0 and prob == 0:
 
-                    else:
-                        total_ll += -np.log(prob / denominator + 1e-8)
+                        # print(sample_size, context, beta_index, q_index, beta, sd, s_het, -np.log(prob / denominator) )
+                        # continue
+                        # raise ValueError
 
-        return total_ll
+                    # else:
+
+                    # beta_range = self.all_beta_ranges[index]
+                    # beta_index = np.argmin(np.abs(beta - beta_range))
+                    # print(self.cache_denominators[index][beta_index], beta, beta_index, np.max(self.cache_denominators[index]))
+                    
+                    
+                    
+                    # if not np.isnan((numerator/denominator)[beta_index]):
+                    # print(prob, -np.log(prob))
+                    total_ll += -np.log(prob)# *
+                             #np.abs(np.diff(self.all_beta_ranges[index]))))
+                    # if total_ll == np.inf:
+                    #     print(beta, np.sum(llhood), np.sum(numerator), np.sum(denominator),
+                    #         self.cache_denominators[index][1:], np.diff(self.all_beta_ranges[index]),
+                    #         self.all_weights[index], q_index, self.likelihoods[sample_size][context][q_index, :])
+                    #     raise ValueError
+                    # print(total_ll)
+                    # raise ValueError
+                    # total_ll += prob / denominator  # + 1e-8)
+                    # print(beta, sd, q_index, prob, denominator, total_ll)
+                    # results.append(prob/denominator)
+
+                    # print((prob / denominator + 1e-8), cur_q, sample_size, closest_sample_size, context, closest_sample_size_inside, closest_context)
+        if separate_cs:
+            # print(c_positive, c_negative, neutral_prob, total_ll)
+            self.param_history.append([c_positive, c_negative, neutral_prob])
+            self.likelihood_history.append(total_ll)
+        else:
+            # print(c, neutral_prob, total_ll)
+            self.param_history.append([c, neutral_prob])
+            self.likelihood_history.append(total_ll)
+        return total_ll#, results
 
     def likelihood_ratio_test(self, neutral_ll, alt_ll):
         # Likelihood ratio test is -2 * ln(L_0) - ln(l_alt)

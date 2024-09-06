@@ -13,14 +13,14 @@ library(nnls)
 library(viridis)
 library(DescTools)
 
-setwd('~/Desktop/5prime_utr/')
+setwd('/Users/awohns/Documents/5primeutr/error_modelling')
 
 
 #-----------------#
 # SPECIFICATIONS  #
 #-----------------#
 read_filter_spec = 0
-epsilon_spec = 0
+epsilon_spec = 1
 normalization_spec = 'rpm'
 reference_spec = 'median'
 remove_input_0_spec = TRUE
@@ -836,14 +836,14 @@ n_bins = 100
 #----------------------#
 
 # NaP-TRAP data 
-df_raw = read.csv('./data/raw/humvar_5utr_ntrap_v6_pm_reads_counts_041824.csv')
+df_raw = read.csv('~/Documents/5primeutr/data/humvar_5utr_ntrap_v6_pm_reads_counts_041824.csv')
 df_spikeins = df_raw %>% filter(grepl("spk", X))
 
 df = df_raw %>%
   separate(X, into=c('gene', 'humvar'), "_")
 
 # Predicted categories 
-df_categories_raw = read.csv('./data/processed/annotated_variants_90k.csv')
+df_categories_raw = read.csv('~/Downloads/annotated_variants_90k_revised.csv')
 df_categories = keep_relevant_cols_from_df_categories(df_categories_raw)
 
 # Merge NaP-TRAP and categories
@@ -985,7 +985,7 @@ df = transform_diploid_to_haploid(df,
                                   'ash_posterior_se_log2_diploid', all_reps=TRUE)
 
 # 15. Save data
-write.csv(df, '../data/humvar_5utr_ntrap_v6_ash_wohns_beta.csv', row.names=FALSE)
+write.csv(df, '../data/humvar_5utr_ntrap_v6_ash_epsilon_1_08_07_24.csv', row.names=FALSE)
 
 
 #-------------------------------------#

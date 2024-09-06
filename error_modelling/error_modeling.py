@@ -45,6 +45,7 @@ class ErrorModeling:
         gene_names_path,
         gnomad_freq_path,
         null_or_nan=False,
+        normalization="rpm"
     ):
         """
         Function to load all the prerequisite data
@@ -52,11 +53,49 @@ class ErrorModeling:
         null_or_nan: if True, add all variants without a predicted effect (i.e. nan) to the Null category.
             If False, exclude these variants
         """
+        if normalization != "rpm" and normalization != "spike":
+            raise ValueError("normalization must be RPM or spike")
+        self.normalization = normalization
 
         self.null_or_nan = null_or_nan
 
         # Load csv of input & pulldown for all reporters, including all variants tested
         naptrap_counts = pd.read_csv(naptrap_results_path, index_col=0)
+
+        for replicate in range(1, 5):
+            if self.normalization == "rpm":
+                # Calculate RPM values
+                naptrap_counts.loc[:, "input_rpm_12h_B" + str(replicate)] = (
+                    naptrap_counts["input_12h_B" + str(replicate)]
+                    / np.sum(naptrap_counts["input_12h_B" + str(replicate)])
+                ) * 1000000
+                naptrap_counts.loc[:, "pulldown_rpm_12h_B" + str(replicate)] = (
+                    naptrap_counts["pulldown_12h_B" + str(replicate)]
+                    / np.sum(naptrap_counts["pulldown_12h_B" + str(replicate)])
+                ) * 1000000
+
+                # Calculate translation values for both replicates
+                naptrap_counts.loc[:, "trans_B" + str(replicate)] = (
+                    naptrap_counts["pulldown_rpm_12h_B" + str(replicate)]
+                    / naptrap_counts["input_rpm_12h_B" + str(replicate)]
+                ) + 0.001
+            elif self.normalization == "spike":
+                normalizations = naptrap_counts[naptrap_counts.index.str.contains("spk")].sum(axis=0)
+                nonspike = ~naptrap_counts.index.str.contains("spk")
+                naptrap_counts.loc[:, "input_spike_12h_B" + str(replicate)] = np.full(naptrap_counts.shape[0], np.nan)
+                naptrap_counts.loc[:, "pulldown_spike_12h_B" + str(replicate)] = np.full(naptrap_counts.shape[0], np.nan)
+                naptrap_counts.loc[:, "input_spike_12h_B" + str(replicate)][nonspike] = (
+                    naptrap_counts["input_12h_B" + str(replicate)][nonspike]
+                    / normalizations["input_12h_B" + str(replicate)])
+                naptrap_counts.loc[:, "pulldown_spike_12h_B" + str(replicate)][nonspike] = (
+                    naptrap_counts["pulldown_12h_B" + str(replicate)][nonspike]
+                    / normalizations["pulldown_12h_B" + str(replicate)])
+
+                # Calculate translation values for both replicates
+                naptrap_counts.loc[:, "trans_B" + str(replicate)] = (
+                    naptrap_counts["pulldown_spike_12h_B" + str(replicate)]
+                    / naptrap_counts["input_spike_12h_B" + str(replicate)]
+                )
 
         # We'll only use variants with input reads > 0
         naptrap_counts = naptrap_counts[
@@ -65,6 +104,7 @@ class ErrorModeling:
             & (naptrap_counts["input_12h_B3"] > 0)
             & (naptrap_counts["input_12h_B4"] > 0)
         ]
+        print("After filtering, we have: {} variants".format(naptrap_counts.shape[0]))
 
         # Load csv of predicted effects for each reporter passing QC
         naptrap_predicted_effects = pd.read_csv(predicted_results_path)
@@ -96,12 +136,17 @@ class ErrorModeling:
             naptrap_counts,
             right_index=True,
             left_on="humvar",
-            how="right",
+            how="inner",
         )
+        out = naptrap_counts[~naptrap_counts.index.isin(naptrap_counts_predicted["humvar"])]
+        print(out[~out.index.str.contains('ref')].shape)
+        print(naptrap_counts.shape)
+        print("After merging with predicted effects we have {} variants".format(naptrap_counts_predicted.shape[0]))
+        print("Unique rows {}".format(np.unique(naptrap_counts_predicted["humvar"]).shape[0]))
 
-        naptrap_counts_predicted = naptrap_counts_predicted.drop(
-            columns=["ref_seq", "insert_seq"]
-        )
+        # naptrap_counts_predicted = naptrap_counts_predicted.drop(
+        #     columns=["ref_seq", "insert_seq"]
+        # )
 
         # Extract gene_id from humvar
         naptrap_counts_predicted["gene_id"] = naptrap_counts_predicted.humvar.str.split(
@@ -116,35 +161,23 @@ class ErrorModeling:
         merged = pd.merge(
             gnomad_freq,
             naptrap_counts_predicted,
-            on=["humvar"],
+            on=["humvar"], how="inner"
         )
+        print("After merging with frequencies we have {} variants".format(merged.shape[0]))
+        print("Unique rows {}".format(np.unique(merged["humvar"]).shape[0]))
 
         merged = pd.merge(
-            gene_to_hgnc, merged, left_on=["Input"], right_on="gene", how="right"
+            gene_to_hgnc, merged, left_on=["Input"], right_on="gene", how="inner"
         )
-
+        print("After merging with hgnc we have {} variants".format(merged.shape[0]))
+        print("Unique rows {}".format(np.unique(merged["humvar"]).shape[0]))
         assert np.sum(np.isnan(merged["allele_count"]) == 0)
 
-        self.data = pd.merge(merged, shet, left_on="HGNC ID", right_on="hgnc")
+        self.data = pd.merge(merged, shet, left_on="HGNC ID", right_on="hgnc", how="inner")
+        print("After merging with shet we have {} variants".format(self.data.shape[0]))
+        print("Unique rows {}".format(np.unique(self.data["humvar"]).shape[0]))
 
     def precision_weighted_mean_se(self, output_path):
-        for replicate in range(1, 5):
-            # Calculate RPM values
-            self.data.loc[:, "input_rpm_12h_B" + str(replicate)] = (
-                self.data["input_12h_B" + str(replicate)]
-                / np.sum(self.data["input_12h_B" + str(replicate)])
-            ) * 1000000
-            self.data.loc[:, "pulldown_rpm_12h_B" + str(replicate)] = (
-                self.data["pulldown_12h_B" + str(replicate)]
-                / np.sum(self.data["pulldown_12h_B" + str(replicate)])
-            ) * 1000000
-
-            # Calculate translation values for both replicates
-            self.data.loc[:, "trans_B" + str(replicate)] = (
-                self.data["pulldown_rpm_12h_B" + str(replicate)]
-                / self.data["input_rpm_12h_B" + str(replicate)]
-            )
-
         # Determine the median translation values for each gene
         median_norm_1 = np.full(self.data.shape[0], np.nan, dtype=float)
         median_norm_2 = np.full(self.data.shape[0], np.nan, dtype=float)
@@ -188,10 +221,10 @@ class ErrorModeling:
             # Haploid linear scale
             self.data.loc[:, "norm_B" + str(replicate + 1)] = median_norm - 1
 
-            # Convert to diploid scale
-            self.data.loc[:, "norm_B" + str(replicate + 1)] = np.log2(
-                1 + self.data["norm_B" + str(replicate + 1)] / 2
-            )
+            # # Convert to diploid scale
+            # self.data.loc[:, "norm_B" + str(replicate + 1)] = np.log2(
+            #     1 + self.data["norm_B" + str(replicate + 1)] / 2
+            # )
 
         # Drop genes with median translation values of 0
         print("Before dropping median values of 0", self.data.shape)
@@ -210,7 +243,7 @@ class ErrorModeling:
             # Group by 'gene' and compute the median for each group
             self.data[new_col] = (
                 self.data.groupby("gene")[orig_col].transform("median")
-                * self.data["input_rpm_12h_B" + str(replicate + 1)]
+                * self.data["input_" + self.normalization + "_12h_B" + str(replicate + 1)]
             )
 
         # for gene in np.unique(self.data.gene_id):
@@ -227,18 +260,7 @@ class ErrorModeling:
         #     expected = np.full(self.data.shape[0], np.nan, dtype=float)
         # self.data.loc[:, "expected_pulldown_B" + str(replicate_outer)] = expected
 
-        # Find all 4 choose 2 covariances and take the mean
-        cov_1_2 = np.cov(self.data["norm_B1"], self.data["norm_B2"], ddof=1)[0][1]
-        cov_1_3 = np.cov(self.data["norm_B1"], self.data["norm_B3"], ddof=1)[0][1]
-        cov_1_4 = np.cov(self.data["norm_B1"], self.data["norm_B4"], ddof=1)[0][1]
-        cov_2_3 = np.cov(self.data["norm_B2"], self.data["norm_B3"], ddof=1)[0][1]
-        cov_2_4 = np.cov(self.data["norm_B2"], self.data["norm_B4"], ddof=1)[0][1]
-        cov_3_4 = np.cov(self.data["norm_B3"], self.data["norm_B4"], ddof=1)[0][1]
-
-        self.overall_cov = np.mean(
-            [cov_1_2, cov_1_3, cov_1_4, cov_2_3, cov_2_4, cov_3_4]
-        )
-
+       
         # Bin the genes based on expected pulldown values (using replicate 1 as an example, adjust as necessary)
         probs = np.linspace(0.01, 0.99, 100)
 
@@ -259,20 +281,46 @@ class ErrorModeling:
             SE_arr = np.full(self.data.shape[0], np.nan, dtype=float)
             for bin in range(1, len(bin_values)):
                 subset = self.data[self.data["bins_B" + str(replicate)] == bin]
-                SE = np.sqrt(
-                    np.sum(
+                # Find all 4 choose 2 covariances and take the mean
+                cov_1_2 = np.cov(subset["norm_B1"], subset["norm_B2"], ddof=1)[0][1]
+                cov_1_3 = np.cov(subset["norm_B1"], subset["norm_B3"], ddof=1)[0][1]
+                cov_1_4 = np.cov(subset["norm_B1"], subset["norm_B4"], ddof=1)[0][1]
+                cov_2_3 = np.cov(subset["norm_B2"], subset["norm_B3"], ddof=1)[0][1]
+                cov_2_4 = np.cov(subset["norm_B2"], subset["norm_B4"], ddof=1)[0][1]
+                cov_3_4 = np.cov(subset["norm_B3"], subset["norm_B4"], ddof=1)[0][1]
+
+                overall_cov = np.mean(
+                    [cov_1_2, cov_1_3, cov_1_4, cov_2_3, cov_2_4, cov_3_4]
+                )
+                # SE = np.sqrt((np.var(subset["norm_B" + str(replicate)]) ) / subset.shape[0])
+                # Var = np.sqrt(
+                #     np.sum(
+                #         (
+                #             subset["norm_B" + str(replicate)]
+                #             - np.mean(subset["norm_B" + str(replicate)])
+                #         )
+                #         ** 2
+                #     )
+                #     / subset.shape[0]
+                # )
+                SE = np.sum(
                         (
                             subset["norm_B" + str(replicate)]
                             - np.mean(subset["norm_B" + str(replicate)])
                         )
                         ** 2
-                    )
-                    / subset.shape[0]
-                )
+                    ) / subset.shape[0]
+
+                SE = SE - overall_cov
+
+                # SE = np.sqrt(SE/subset.shape[0])        
+            
                 print(f"Bin {bin} Variance for trans_b {replicate}: {SE}")
-                SE_arr[self.data["bins_B" + str(replicate)] == bin] = (
-                    SE - self.overall_cov
-                )
+                SE_arr[self.data["bins_B" + str(replicate)] == bin] = SE
+
+                # SE_arr[self.data["bins_B" + str(replicate)] == bin] = (
+                #     SE - self.overall_cov
+                # )
 
             self.data.loc[:, "SE_B" + str(replicate)] = SE_arr
 
@@ -359,3 +407,11 @@ class ErrorModeling:
                 ],
             }
         ).to_csv(output_path + "_positive_predicted.csv")
+
+        # All variants
+        pd.DataFrame(
+            {
+                "mean": precision_weighted_mean,
+                "ses": precision_weighted_se,
+            }
+        ).to_csv(output_path + "_all_predicted.csv")
