@@ -382,18 +382,18 @@ class Likelihoods:
         self.all_weights = []
 
         # Precompute beta ranges for all unique combinations
-        for s_het, beta in zip(self.cur_s_het, self.betas):
+        for s_het, beta in zip(self.s_het, self.betas):
             pos_beta_range = np.sqrt(self.S_GRID / (s_het * c_value))
             neg_beta_range = -np.sqrt(self.S_GRID / (s_het * c_value))
             self.all_beta_ranges.append(np.concatenate([np.flip(neg_beta_range), pos_beta_range]))
             # self.all_beta_ranges.append(np.sort(beta_range))
         self.all_beta_ranges = np.array(self.all_beta_ranges)
         loc = np.expand_dims(self.betas, axis=-1)  # Shape becomes (80330, 1)
-        scale = np.expand_dims(self.cur_sds, axis=-1)  # Shape becomes (80330, 1)
+        scale = np.expand_dims(self.sds, axis=-1)  # Shape becomes (80330, 1)
         self.all_weights = norm.pdf(self.all_beta_ranges, loc=loc, scale=scale)
 
         # For rows where SD is close to 0, assign all weight to closest value
-        sd_zero = np.isclose(self.cur_sds, 0)
+        sd_zero = np.isclose(self.sds, 0)
         self.all_weights[sd_zero] = np.zeros_like(self.all_weights[sd_zero])
         expanded_betas = self.betas[sd_zero][:, np.newaxis]
         min_indices = np.argmin(np.abs(expanded_betas - self.all_beta_ranges[sd_zero]), axis=1)
@@ -441,9 +441,9 @@ class Likelihoods:
         self,
         sample_sizes,
         betas,
-        cur_sds,
-        cur_s_het,
-        cur_q,
+        sds,
+        s_het,
+        qs,
         contexts,
         progress=False,
     ):
@@ -457,9 +457,9 @@ class Likelihoods:
                 np.array(
                     [
                         len(betas),
-                        len(cur_sds),
-                        len(cur_s_het),
-                        len(cur_q),
+                        len(sds),
+                        len(s_het),
+                        len(qs),
                         len(contexts),
                     ]
                 ),
@@ -469,7 +469,7 @@ class Likelihoods:
         self.closest_sample_sizes = []
         self.closest_contexts = []
         for index, (context, sample_size) in enumerate(zip(contexts, sample_sizes)):
-            # if sample_size >= np.max(cur_q):
+            # if sample_size >= np.max(qs):
             # closest_sample_size = self.sample_size_keys[-1]
             if sample_size in self.sample_size_keys:
                 closest_sample_size = sample_size
@@ -485,28 +485,88 @@ class Likelihoods:
                 ]
             self.closest_sample_sizes.append(closest_sample_size)
             self.closest_contexts.append(self.closest_context(context))
-
+        self.closest_contexts = np.array(self.closest_contexts)
         # self.create_ll_cache(
         #     self.closest_contexts, self.closest_sample_sizes, progress=progress
         # )
         self.sample_sizes = np.array(sample_sizes)
+        self.closest_sample_sizes = np.array(self.closest_sample_sizes)
         self.betas = np.array(betas)
-        self.cur_sds = np.array(cur_sds)
-        self.cur_s_het = np.array(cur_s_het)
-        self.cur_q = np.array(cur_q)
+        self.sds = np.array(sds)
+        self.s_het = np.array(s_het)
+        self.qs = np.array(qs)
 
         if self.normalized:
-            self.cur_q = self.cur_q.astype(int) - 1
+            self.qs = self.qs.astype(int) - 1
         else:
             # if not normalized 
-            self.cur_q = self.cur_q.astype(int)
-        self.contexts = contexts
+            self.qs = self.qs.astype(int)
+        self.contexts = np.array(contexts)
 
         self.ll_indices = []
         self.param_history = []
         self.likelihood_history = []
 
-    def compute_ll(self, params, progress=True):
+
+    def quadratic_s(self, c, shet, beta):
+        """
+        Return the selection coefficient s, under a quadratic model where s = c * shet * beta**2
+        """
+        return c * shet * beta ** 2
+
+    def compute_ll_piecewise_bin_no_se_no_neutral(self, c, bin_left, bin_right, progress=True):
+        """
+        Compute likelihood of data in a particular bin given c, without considering standard errors
+        from ash or a neutral proportion. Bin edges are inclusive on the left and exclusive on the
+        right, i.e.: [bin_left, bin_right)
+        """
+        assert self.normalized
+        # determine which data points to include based on given bin
+        bool_include = np.logical_and(self.betas >= bin_left, self.betas < bin_right)
+        # calculate s given c and shet
+        s = self.s_het[bool_include] * c
+        # find the closest s index in the likelihood table for each included data point
+        closest_s_index = [np.argmin(np.abs(self.S_GRID - s_val)) for s_val in s]
+        # only include frequency, sample_size, and context data if they fall in the bin
+        q_include = self.qs[bool_include]
+        sample_size_include = self.closest_sample_sizes[bool_include]
+        context_include = self.closest_contexts[bool_include]
+        # iterate over data points, multiplying likelihoods to find the total_ll
+        total_ll = 0
+        for s_index, q_index, sample_size, context in zip(closest_s_index, q_include, sample_size_include, context_include):
+            llhood = self.likelihoods[sample_size][context][q_index, s_index]
+            total_ll += np.log(llhood)
+        return - total_ll
+
+    def compute_ll_piecewise_bin_no_se(self, c, neutral_prop, bin_left, bin_right, progress=True):
+        """
+        Compute likelihood of data in a particular bin given c, without considering standard errors
+        from ash. Bin edges are inclusive on the left and exclusive on the
+        right, i.e.: [bin_left, bin_right)
+        """
+        assert self.normalized
+        # determine which data points to include based on given bin
+        bool_include = np.logical_and(self.betas >= bin_left, self.betas < bin_right)
+        # calculate s given c and shet
+        s = self.s_het[bool_include] * c
+        # find the closest s index in the likelihood table for each included data point
+        closest_s_index = [np.argmin(np.abs(self.S_GRID - s_val)) for s_val in s]
+        # only include frequency, sample_size, and context data if they fall in the bin
+        q_include = self.qs[bool_include]
+        sample_size_include = self.closest_sample_sizes[bool_include]
+        context_include = self.closest_contexts[bool_include]
+        # iterate over data points, multiplying likelihoods to find the total_ll
+        total_ll = 0
+        for s_index, q_index, sample_size, context in zip(closest_s_index, q_include, sample_size_include, context_include):
+            llhood = self.likelihoods[sample_size][context][q_index, s_index]
+            llhood_neutral = self.likelihoods[sample_size][context][q_index, 0]
+            total_ll += np.log((llhood * (1 - neutral_prop)) + (llhood_neutral * neutral_prop))
+        return - total_ll
+
+    def compute_ll_quadratic(self, params, progress=True):
+        """
+        Compute likelihood under a quadratic model
+        """
         results = []
         if len(params) == 3:
             c_positive = params[0]
@@ -528,12 +588,12 @@ class Likelihoods:
         # # cache_weights = {}
         # self.all_beta_ranges = []
         # self.all_weights = []
-        # # combined_array = np.column_stack((self.cur_s_het, self.betas))
+        # # combined_array = np.column_stack((self.s_het, self.betas))
         # # unique_combinations = np.unique(combined_array, axis=0)
 
         # # Precompute beta ranges for all unique combinations
         # # for s_het, beta in tqdm(unique_combinations):
-        # for s_het, beta in zip(self.cur_s_het, self.betas):
+        # for s_het, beta in zip(self.s_het, self.betas):
         #     if separate_cs:
         #         c_value = c_positive if beta > 0 else c_negative
         #     else:
@@ -542,7 +602,7 @@ class Likelihoods:
         #     self.all_beta_ranges.append(beta_range)
         # self.all_beta_ranges = np.array(self.all_beta_ranges)
         # loc = np.expand_dims(np.abs(self.betas), axis=-1)  # Shape becomes (80330, 1)
-        # scale = np.expand_dims(self.cur_sds, axis=-1)  # Shape becomes (80330, 1)
+        # scale = np.expand_dims(self.sds, axis=-1)  # Shape becomes (80330, 1)
         # self.all_weights = norm.pdf(self.all_beta_ranges, loc=loc, scale=scale)
 
         # # CHECK THIS PART
@@ -560,7 +620,7 @@ class Likelihoods:
         # self.all_weights[zero_rows, min_indices] = 1
 
         # # For rows where SD is close to 0, assign all weight to closest value
-        # sd_zero = np.isclose(self.cur_sds, 0)
+        # sd_zero = np.isclose(self.sds, 0)
         # self.all_weights[sd_zero] = np.zeros_like(self.all_weights[sd_zero])
         # expanded_betas = self.betas[sd_zero][:, np.newaxis]
         # min_indices = np.argmin(np.abs(expanded_betas - self.all_beta_ranges[sd_zero]), axis=1)
@@ -573,7 +633,7 @@ class Likelihoods:
         # self.all_weights = self.all_weights / weights_sum
         # assert ~np.any(np.isnan(self.all_weights))
 
-        # combined_array = np.column_stack((self.cur_s_het, self.betas, self.cur_sds))
+        # combined_array = np.column_stack((self.s_het, self.betas, self.sds))
         # unique_combinations = np.unique(combined_array, axis=0)
         # for s_het, beta, sd in tqdm(unique_combinations):
         #     beta_range = cache_beta_range[(s_het, beta)]
@@ -613,9 +673,9 @@ class Likelihoods:
             enumerate(
                 zip(
                     self.betas,
-                    self.cur_sds,
-                    self.cur_s_het,
-                    self.cur_q,
+                    self.sds,
+                    self.s_het,
+                    self.qs,
                     self.closest_contexts,
                     self.closest_sample_sizes,
                 )
@@ -780,7 +840,7 @@ class Likelihoods:
                     # print(beta, sd, q_index, prob, denominator, total_ll)
                     # results.append(prob/denominator)
 
-                    # print((prob / denominator + 1e-8), cur_q, sample_size, closest_sample_size, context, closest_sample_size_inside, closest_context)
+                    # print((prob / denominator + 1e-8), qs, sample_size, closest_sample_size, context, closest_sample_size_inside, closest_context)
         if separate_cs:
             # print(c_positive, c_negative, neutral_prob, total_ll)
             self.param_history.append([c_positive, c_negative, neutral_prob])
