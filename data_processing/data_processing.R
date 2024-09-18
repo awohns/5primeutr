@@ -9,10 +9,23 @@ library(stringr)
 library(plotrix)
 library(devtools)
 library(ashr)
+library(nnls)
 library(viridis)
 library(DescTools)
 
 setwd('~/Desktop/5prime_utr/')
+
+
+#-----------------#
+# SPECIFICATIONS  #
+#-----------------#
+read_filter_spec = 0
+epsilon_spec = 0
+normalization_spec = 'rpm'
+reference_spec = 'median'
+remove_input_0_spec = TRUE
+remove_median_0_spec = TRUE
+min_cap_spec = -5
 
 
 #------------#
@@ -36,13 +49,11 @@ keep_relevant_cols_from_df_categories = function(df_categories_raw){
   
   df_categories = df_categories_raw %>%
     rowwise() %>%
-    mutate(humvar = paste(Chr, Position, Ref, Alt, sep='-')) %>%
-    ungroup() %>%
-    rename(predicted_category3 = 'predicted_category') %>%
-    mutate(predicted_category4 = 
-             ifelse(variant_type %in% c('Complete loss of ORFs'),
-                    'Total loss', predicted_category3)) %>%
-    select(humvar, predicted_category3, predicted_category4)
+    rename(predicted_category = 'predicted_category') %>%
+    select(gene_id, humvar, 
+           orf_ann_ref, orf_ann_alt,
+           variant_type, variant_type_adjusted,
+           ref_seq, insert_seq, predicted_category)
   
   return(df_categories)
 }
@@ -56,10 +67,16 @@ read_filter = function(df, n_min_reads){
     mutate(min_reads_input = min(input_12h_B1, input_12h_B2,
                                  input_12h_B3, input_12h_B4),
            min_reads_pulldown = min(pulldown_12h_B1, pulldown_12h_B2,
-                                    pulldown_12h_B3, pulldown_12h_B4)) %>%
-    filter(min_reads_input >= n_min_reads | min_reads_pulldown >= n_min_reads) %>%
-    ungroup()
-           
+                                    pulldown_12h_B3, pulldown_12h_B4))
+  
+  if (n_min_reads >= 0){
+    
+    df = df %>%
+      filter(min_reads_input >= n_min_reads | min_reads_pulldown >= n_min_reads) %>%
+      ungroup()
+    
+  } 
+  
   return(df)
   
 }
@@ -71,6 +88,36 @@ remove_reporters_with_any_zeros = function(df){
                                 input_12h_B3 == 0 | input_12h_B4 == 0, 1, 0)) %>%
     filter(to_remove == 0) %>%
     select(-to_remove)
+  
+  return(df)
+  
+}
+
+remove_genes_with_0_median = function(df){
+  
+  # Calculate translation
+  df = df %>%
+    mutate(translation1 = pulldown_12h_B1/input_12h_B1,
+           translation2 = pulldown_12h_B2/input_12h_B2,
+           translation3 = pulldown_12h_B3/input_12h_B3,
+           translation4 = pulldown_12h_B4/input_12h_B4)
+  
+  # Calculate median 
+  df = df %>%
+    group_by(gene) %>%
+    
+    # Compute median translation 
+    mutate(median1 = median(translation1),
+           median2 = median(translation2),
+           median3 = median(translation3),
+           median4 = median(translation4)) %>%
+    
+    ungroup() %>%
+    
+    filter(median1 != 0,
+           median2 != 0,
+           median3 != 0,
+           median4 != 0)
   
   return(df)
   
@@ -163,16 +210,15 @@ calculate_delta_translation = function(df, reference_txt){
     ungroup()
   
   if (reference_txt == 'median'){
-
+    
     # Calculate delta translation 
     df = df %>%
       mutate(delta_t1 = (translation1/median1),
              delta_t2 = (translation2/median2),
              delta_t3 = (translation3/median3),
              delta_t4 = (translation4/median4)) %>%
-      
       filter(humvar != 'ref')
-        
+    
   } else if (reference_txt == 'reference'){
     
     df_refs = df %>%
@@ -183,9 +229,19 @@ calculate_delta_translation = function(df, reference_txt){
              ref3 = 'translation3',
              ref4 = 'translation4')
     
-    df = merge(df, df_refs, by='gene')
+    df = df %>%
+      filter(humvar != 'ref')
+    
+    genes_without_refs = df$gene[!(df$gene %in% df_refs$gene)]
+    n_vars_affected = length(genes_without_refs)
+    
+    print(str_interp("${n_vars_affected} variants removed due to missing reference."))
+    
+    df = merge(df, df_refs, by='gene', all.x=TRUE, all.y=FALSE)
     
     df = df %>%
+      
+      filter(!(gene %in% genes_without_refs)) %>%
       
       # Calculate delta translation 
       mutate(delta_t1 = (translation1/ref1),
@@ -194,21 +250,14 @@ calculate_delta_translation = function(df, reference_txt){
              delta_t4 = (translation4/ref4)) %>%
       
       select(-ref1, -ref2, -ref3, -ref4)
-      
+    
   }
-  
-  # Calculate log2_delta_t
-  df = df %>%
-    mutate(log2_delta_t1 = log2(delta_t1),
-           log2_delta_t2 = log2(delta_t2),
-           log2_delta_t3 = log2(delta_t3),
-           log2_delta_t4 = log2(delta_t4))
   
   return(df)
   
 }
 
-calculate_fold_changes = function(df){
+calculate_diploid_fold_changes = function(df){
   
   df = df %>%
     
@@ -236,189 +285,426 @@ calculate_fold_changes = function(df){
   
 }
 
+calculate_expected_pulldown = function(df){
+  
+  # Bin variants based on mean expected pulldown  
+  df = df %>%
+    
+    # Calculate expected pulldown
+    mutate(expected_pulldown_1 = input_12h_B1_norm*median1,
+           expected_pulldown_2 = input_12h_B2_norm*median2,
+           expected_pulldown_3 = input_12h_B3_norm*median3,
+           expected_pulldown_4 = input_12h_B4_norm*median4) %>%
+    
+    ungroup()
+  
+  return(df)
+}
+
 
 # Calculate SEs 
-solve_for_se_values = function(var_diffs) {
+get_design_matrix = function(x, num_bins) {
+  n <- nrow(x)
+  p <- ncol(x)
   
-  var_values = solve(coef_matrix, var_diffs)
-  se_values = sqrt(var_values)
+  # Compute the bin edges based on quantiles
+  x_bin <- quantile(array(unlist(x)),
+                    probs = seq(0, 1,
+                                length.out = num_bins + 1
+                    )
+  )[-(num_bins + 1)]
   
-  return(se_values)
+  # Digitize x based on the computed bin edges
+  bins <- matrix(findInterval(array(unlist(x)), x_bin, left.open = TRUE), n, p)
   
+  # Initialize the one-hot encoding vector, v
+  v <- array(0, dim = c(n, p, num_bins))
+  for (i in 1:n) {
+    for (j in 1:p) {
+      v[i, j, 1:bins[i, j]] <- 1
+    }
+  }
+  
+  # Compute the coefficients for the diagonal and off-diagonal elements
+  diag_coef <- ((p - 1) / p)^2
+  offdiag_coef <- (1 / p)^2
+  
+  # Calculate u: made up of one hot encoding and coefficent matrix
+  u <- array(0, dim = c(n, p, num_bins))
+  for (i in 1:n) {
+    for (k in 1:p) {
+      u[i, k, ] <- (diag_coef - offdiag_coef) *
+        v[i, k, ] + offdiag_coef * colSums(v[i, , ])
+    }
+  }
+  
+  return(list(u = u, v = v))
 }
 
-calculate_SE_diploid = function(df){
+estimate_standard_error = function(y, x, num_bins) {
+  x <- 1 / x
+  n <- nrow(x)
+  p <- ncol(x)
+  
+  # Get design matrix
+  design_matrices <- get_design_matrix(x, num_bins)
+  A <- design_matrices$u
+  V <- design_matrices$v
+  
+  residuals <- y - matrix(
+    rep(apply(y, 1, mean), ncol(y)),
+    nrow = nrow(y), ncol = ncol(y)
+  )
+  
+  A_transposed <- aperm(A, c(3, 2, 1))
+  dims <- dim(A)
+  nrow <- prod(dims[1:2]) # Number of rows to reshape to
+  ncol <- dims[3]
+  A_flat_row_major <- as.vector(A_transposed)
+  A <- matrix(A_flat_row_major, nrow = nrow, ncol = ncol, byrow = TRUE)
+  V_transposed <- aperm(V, c(3, 2, 1))
+  V_flat_row_major <- as.vector(V_transposed)
+  V <- matrix(V_flat_row_major, nrow = nrow, ncol = ncol, byrow = TRUE)
+  residuals <- as.vector(t(residuals))
+  
+  # Solve for theta using NNLS
+  nnls_result <- nnls(A, residuals^2)
+  theta <- coef(nnls_result)
+  
+  return(matrix(V %*% theta, nrow = n, ncol = p, byrow = TRUE))
+}
 
-  # Bin variants based on mean expected pulldown  
-  df = df %>%
-    
-    # Calculate expected pulldown
-    mutate(expected_pulldown_1 = input_12h_B1_norm*median1,
-           expected_pulldown_2 = input_12h_B2_norm*median2,
-           expected_pulldown_3 = input_12h_B3_norm*median3,
-           expected_pulldown_4 = input_12h_B4_norm*median4) %>%
-    
-    rowwise() %>%
-    
-    mutate(mean_expected_pulldown = sum(expected_pulldown_1,
-                                        expected_pulldown_2, 
-                                        expected_pulldown_3,
-                                        expected_pulldown_4)/4) %>%
-    
-    ungroup() %>%
-    
-    # Bin reporters based on expected pulldown 
-    mutate(bins = ntile(mean_expected_pulldown, n_bins)) %>%
-    select(-starts_with("expected_pulldown"))
+calculate_se = function(df, beta, num_bins) {
   
+  x <- as.matrix(
+    df[c(
+      "expected_pulldown_1", "expected_pulldown_2",
+      "expected_pulldown_3", "expected_pulldown_4"
+    )]
+  )
   
-  # Calculate var(diff_[1-4]) within bins
-  df = df %>% 
-    
-    # Calculate var(beta-mean_beta)
-    rowwise() %>%
-    mutate(mean = (log2_diploid_fc1 + log2_diploid_fc2 +
-                     log2_diploid_fc3 + log2_diploid_fc4)/4,
-           
-           diff_1 = log2_diploid_fc1 - mean,
-           diff_2 = log2_diploid_fc2 - mean,
-           diff_3 = log2_diploid_fc3 - mean,
-           diff_4 = log2_diploid_fc4 - mean) %>%
-    
-    ungroup() %>% 
-    group_by(bins) %>%
-    
-    mutate(var_diff_1 = var(diff_1),
-           var_diff_2 = var(diff_2),
-           var_diff_3 = var(diff_3),
-           var_diff_4 = var(diff_4)) %>%
-    
-    ungroup()
+  y <- as.matrix(
+    df[c(
+      paste(beta, 1:4, sep='')
+    )]
+  )
   
+  estimated_error <- sqrt(estimate_standard_error(y, x, num_bins))
+  stopifnot(all(estimated_error >= 0))
+  df_combined <- cbind(df, estimated_error)
   
-  # Calculate SE values by solving for the 4 equations:
-  #   var_diff_1 = (3/4)^2*se_1 + 1/(4^2)*(se_2 + se_3 + se_4)
-  #   var_diff_2 = (3/4)^2*se_2 + 1/(4^2)*(se_1 + se_3 + se_4)
-  #   var_diff_3 = (3/4)^2*se_3 + 1/(4^2)*(se_1 + se_2 + se_4)
-  #   var_diff_4 = (3/4)^2*se_4 + 1/(4^2)*(se_1 + se_2 + se_3)
+  colnames(df_combined)[
+    (ncol(df) + 1):ncol(df_combined)
+  ] <- c(
+    paste("se_", beta, 1:4, sep='')
+  )
   
-  df = df %>%
-    
-    rowwise() %>%
-    mutate(se_log2_diploid = list(solve_for_se_values(c(var_diff_1, var_diff_2, 
-                                                        var_diff_3, var_diff_4)))) %>%
-    unnest_wider(se_log2_diploid, names_sep = "_") %>%
-    ungroup()
-  
-  # Remove unnecessary columns 
-  df = df %>%
-    select(-bins, -mean, -starts_with("diff"), -starts_with("var_diff"))
+  df <- df_combined
   
   return(df)
-  
 }
 
-calculate_SE_delta = function(df){
+calculate_se_translation = function(df){
   
-  # Bin variants based on mean expected pulldown  
+  # Assign translation categories   
   df = df %>%
-    
-    # Calculate expected pulldown
-    mutate(expected_pulldown_1 = input_12h_B1_norm*median1,
-           expected_pulldown_2 = input_12h_B2_norm*median2,
-           expected_pulldown_3 = input_12h_B3_norm*median3,
-           expected_pulldown_4 = input_12h_B4_norm*median4) %>%
-    
-    rowwise() %>%
-    
-    mutate(mean_expected_pulldown = sum(expected_pulldown_1,
-                                        expected_pulldown_2, 
-                                        expected_pulldown_3,
-                                        expected_pulldown_4)/4) %>%
-    
-    ungroup() %>%
-    
-    # Bin reporters based on expected pulldown 
-    mutate(bins = ntile(mean_expected_pulldown, n_bins)) %>%
-    select(-starts_with("expected_pulldown"))
+    mutate(translation_category = ifelse(orf_ann_alt == '{}' |
+                                           !(grepl('main ORF', orf_ann_alt)),
+                                         'Total loss of translation',
+                                         'Some translation'),
+           translation_category = factor(translation_category,
+                                         levels = c('Total loss of translation',
+                                                    'Some translation')))
   
+  # Calculate SE in both categories 
+  df1 = calculate_se(df %>%
+                       filter(translation_category == 'Total loss of translation'),
+                     'translation', n_bins/5)
+  df2 = calculate_se(df %>% filter(translation_category == 'Some translation'),
+                     'translation', n_bins)
   
-  # Calculate var(diff_[1-4]) within bins
-  df = df %>% 
-    
-    # Calculate var(beta-mean_beta)
-    rowwise() %>%
-    mutate(mean = (log2_delta_t1 + log2_delta_t2 +
-                     log2_delta_t3 + log2_delta_t4)/4,
-           
-           diff_1 = log2_delta_t1 - mean,
-           diff_2 = log2_delta_t2 - mean,
-           diff_3 = log2_delta_t3 - mean,
-           diff_4 = log2_delta_t4 - mean) %>%
-    
-    ungroup() %>% 
-    group_by(bins) %>%
-    
-    mutate(var_diff_1 = var(diff_1),
-           var_diff_2 = var(diff_2),
-           var_diff_3 = var(diff_3),
-           var_diff_4 = var(diff_4)) %>%
-    
-    ungroup()
-  
-  
-  # Calculate SE values by solving for the 4 equations:
-  #   var_diff_1 = (3/4)^2*se_1 + 1/(4^2)*(se_2 + se_3 + se_4)
-  #   var_diff_2 = (3/4)^2*se_2 + 1/(4^2)*(se_1 + se_3 + se_4)
-  #   var_diff_3 = (3/4)^2*se_3 + 1/(4^2)*(se_1 + se_2 + se_4)
-  #   var_diff_4 = (3/4)^2*se_4 + 1/(4^2)*(se_1 + se_2 + se_3)
-  
-  df = df %>%
-    
-    rowwise() %>%
-    mutate(se_log2_delta_t = list(solve_for_se_values(c(var_diff_1, var_diff_2,
-                                                      var_diff_3, var_diff_4)))) %>%
-    unnest_wider(se_log2_delta_t, names_sep = "") %>%
-    ungroup()
-  
-  # Remove unnecessary columns 
-  df = df %>%
-    select(-bins, -mean, -starts_with("diff"), -starts_with("var_diff"))
+  # Merge dataframes
+  df = rbind(df1, df2)
   
   return(df)
-  
 }
+
 
 # SE QC plots
-plot_mean_expected_pulldown_vs_SE = function(df, beta_variable){
+plot_expected_pulldown_vs_SE = function(df, beta_variable){
   
   if (beta_variable == 'diploid'){
     
-    pA = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_diploid_1)) + 
-      geom_point() + theme_light()
-    pB = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_diploid_2)) + 
-      geom_point() + theme_light()
-    pC = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_diploid_3)) +
-      geom_point() + theme_light()
-    pD = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_diploid_4)) +
-      geom_point() + theme_light()
+    pA = ggplot(df, aes(x=expected_pulldown_1, y=se_log2_diploid_fc1)) + 
+      geom_point() + theme_light() +
+      xlab("Expected pulldown 1") +
+      ylab(expression(paste("SE of log"[2]*"(diploid FC 1)")))
+      
+    pB = ggplot(df, aes(x=expected_pulldown_2, y=se_log2_diploid_fc2)) + 
+      geom_point() + theme_light() +
+      xlab("Expected pulldown 2") +
+      ylab(expression(paste("SE of log"[2]*"(diploid FC 2)"))) 
     
-    print(gridExtra::grid.arrange(pA, pB, pC, pD, nrow=2))
+    pC = ggplot(df, aes(x=expected_pulldown_3, y=se_log2_diploid_fc3)) +
+      geom_point() + theme_light() +
+      xlab("Expected pulldown 3") +
+      ylab(expression(paste("SE of log"[2]*"(diploid FC 3)")))
+    
+    pD = ggplot(df, aes(x=expected_pulldown_4, y=se_log2_diploid_fc4)) +
+      geom_point() + theme_light() +
+      xlab("Expected pulldown 4") +
+      ylab(expression(paste("SE of log"[2]*"(diploid FC 4)")))
+    
+  } else if (beta_variable == 'translation'){
+    
+    pA = ggplot(df, aes(x=expected_pulldown_1, y=se_translation1,
+                        color=factor(translation_category))) + 
+      geom_point(alpha=0.6) + theme_light() +
+      xlab("Expected pulldown 1") +
+      ylab(expression(paste("SE of translation 1"))) +
+      theme(legend.position='none') +
+      scale_color_manual(values=c('black', 'grey'))
+    
+    pB = ggplot(df, aes(x=expected_pulldown_2, y=se_translation2,
+                        color=factor(translation_category))) +
+      geom_point(alpha=0.6) + theme_light() +
+      xlab("Expected pulldown 2") +
+      ylab(expression(paste("SE of translation 2"))) +
+      theme(legend.position='none') +
+      scale_color_manual(values=c('black', 'grey'))
+    
+    pC = ggplot(df, aes(x=expected_pulldown_3, y=se_translation3,
+                        color=factor(translation_category))) +
+      geom_point(alpha=0.6) + theme_light() +
+      xlab("Expected pulldown 3") +
+      ylab(expression(paste("SE of translation 3"))) +
+      theme(legend.position='none') +
+      scale_color_manual(values=c('black', 'grey'))
+    
+    pD = ggplot(df, aes(x=expected_pulldown_4, y=se_translation4,
+                        color=factor(translation_category))) +
+      geom_point(alpha=0.6) + theme_light() +
+      xlab("Expected pulldown 4") +
+      ylab(expression(paste("SE of translation 4"))) +
+      theme(legend.position='none') +
+      scale_color_manual(values=c('black', 'grey'))
     
   } else if (beta_variable == 'delta_t'){
     
-    pA = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_delta_t1)) +
-      geom_point() + theme_light()
-    pB = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_delta_t2)) +
-      geom_point() + theme_light()
-    pC = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_delta_t3)) +
-      geom_point() + theme_light()
-    pD = ggplot(df, aes(x=mean_expected_pulldown, y=se_log2_delta_t4)) +
-      geom_point() + theme_light()
+    pA = ggplot(df, aes(x=expected_pulldown_1, y=se_delta_t1)) + 
+      geom_point(alpha=0.6) + theme_light() +
+      xlab("Expected pulldown 1") +
+      ylab(expression(paste("SE of delta T 1"))) +
+      theme(legend.position='none') +
+      scale_color_manual(values=c('black', 'grey'))
     
-    print(gridExtra::grid.arrange(pA, pB, pC, pD, nrow=2))
+    pB = ggplot(df, aes(x=expected_pulldown_2, y=se_delta_t2)) +
+      geom_point(alpha=0.6) + theme_light() +
+      xlab("Expected pulldown 2") +
+      ylab(expression(paste("SE of delta T 2"))) +
+      theme(legend.position='none') +
+      scale_color_manual(values=c('black', 'grey'))
+    
+    pC = ggplot(df, aes(x=expected_pulldown_3, y=se_delta_t3)) +
+      geom_point(alpha=0.6) + theme_light() +
+      xlab("Expected pulldown 3") +
+      ylab(expression(paste("SE of delta T 3"))) +
+      theme(legend.position='none') +
+      scale_color_manual(values=c('black', 'grey'))
+    
+    pD = ggplot(df, aes(x=expected_pulldown_4, y=se_delta_t4)) +
+      geom_point(alpha=0.6) + theme_light() +
+      xlab("Expected pulldown 4") +
+      ylab(expression(paste("SE of delta T 4"))) +
+      theme(legend.position='none') +
+      scale_color_manual(values=c('black', 'grey'))
     
   }
+  
+  print(gridExtra::grid.arrange(pA, pB, pC, pD, nrow=2))
+  
+}
+
+plot_expected_pulldown_vs_pulldown = function(df, beta_variable){
+  
+  range1 <- range(log10(df$pulldown_12h_B1_norm[df$pulldown_12h_B1_norm > 0]), 
+                  log10(df$expected_pulldown_1[df$expected_pulldown_1 > 0]))
+  
+  range2 <- range(log10(df$pulldown_12h_B2_norm[df$pulldown_12h_B2_norm > 0]), 
+                  log10(df$expected_pulldown_2[df$expected_pulldown_2 > 0]))
+  
+  range3 <- range(log10(df$pulldown_12h_B3_norm[df$pulldown_12h_B3_norm > 0]), 
+                  log10(df$expected_pulldown_3[df$expected_pulldown_3 > 0]))
+  
+  range4 <- range(log10(df$pulldown_12h_B4_norm[df$pulldown_12h_B4_norm > 0]), 
+                  log10(df$expected_pulldown_4[df$expected_pulldown_4 > 0]))
+  
+  if (beta_variable == 'diploid'){
+    
+    pA = ggplot(df %>%
+                  filter(pulldown_12h_B1_norm != 0,
+                         expected_pulldown_1 != 0), 
+                aes(x=log10(pulldown_12h_B1_norm),
+                        y=log10(expected_pulldown_1), 
+                        color=se_log2_diploid_fc1)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 1"))) +
+      ylab(expression(log[10]("Expected pulldown 1"))) +
+      scale_color_viridis() +
+      labs(color = "SE (diploid FC 1)") +
+      xlim(range1) + ylim(range1)
+    
+    pB = ggplot(df %>%
+                  filter(pulldown_12h_B2_norm != 0,
+                         expected_pulldown_2 != 0), 
+                aes(x=log10(pulldown_12h_B2_norm),
+                        y=log10(expected_pulldown_2), 
+                        color=se_log2_diploid_fc3)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 2"))) +
+      ylab(expression(log[10]("Expected pulldown 2"))) +
+      scale_color_viridis() +
+      labs(color = "SE (diploid FC 2)") +
+      xlim(range2) + ylim(range2)
+      
+    pC = ggplot(df %>%
+                  filter(pulldown_12h_B3_norm != 0,
+                         expected_pulldown_3 != 0), 
+                aes(x=log10(pulldown_12h_B3_norm),
+                        y=log10(expected_pulldown_3), 
+                        color=se_log2_diploid_fc3)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 3"))) +
+      ylab(expression(log[10]("Expected pulldown 3"))) +
+      scale_color_viridis() +
+      labs(color = "SE (diploid FC 3)") +
+      xlim(range3) + ylim(range3)
+    
+    pD = ggplot(df %>%
+                  filter(pulldown_12h_B4_norm != 0,
+                         expected_pulldown_4 != 0), 
+                aes(x=log10(pulldown_12h_B4_norm),
+                        y=log10(expected_pulldown_4), 
+                        color=se_log2_diploid_fc4)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 4"))) +
+      ylab(expression(log[10]("Expected pulldown 4"))) +
+      scale_color_viridis() +
+      labs(color = "SE (diploid FC 4)") +
+      xlim(range4) + ylim(range4)
+    
+  } else if (beta_variable == 'translation'){
+    
+    pA = ggplot(df %>%
+                  filter(pulldown_12h_B1_norm != 0,
+                         expected_pulldown_1 != 0), 
+                aes(x=log10(pulldown_12h_B1_norm),
+                        y=log10(expected_pulldown_1), 
+                        color=se_translation1)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 1"))) +
+      ylab(expression(log[10]("Expected pulldown 1"))) +
+      scale_color_viridis() +
+      labs(color = "SE (translation 1)") +
+      xlim(range1) + ylim(range1)
+    
+    pB = ggplot(df %>%
+                  filter(pulldown_12h_B2_norm != 0,
+                         expected_pulldown_2 != 0), 
+                aes(x=log10(pulldown_12h_B2_norm),
+                        y=log10(expected_pulldown_2), 
+                        color=se_translation2)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 2"))) +
+      ylab(expression(log[10]("Expected pulldown 2"))) +
+      scale_color_viridis() +
+      labs(color = "SE (translation 2)") +
+      xlim(range2) + ylim(range2)
+    
+    pC = ggplot(df %>%
+                  filter(pulldown_12h_B3_norm != 0,
+                         expected_pulldown_3 != 0), 
+                aes(x=log10(pulldown_12h_B3_norm),
+                        y=log10(expected_pulldown_3), 
+                        color=se_translation3)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 3"))) +
+      ylab(expression(log[10]("Expected pulldown 3"))) +
+      scale_color_viridis() +
+      labs(color = "SE (translation 3)") +
+      xlim(range3) + ylim(range3)
+    
+    pD = ggplot(df %>%
+                  filter(pulldown_12h_B4_norm != 0,
+                         expected_pulldown_4 != 0), 
+                aes(x=log10(pulldown_12h_B4_norm),
+                        y=log10(expected_pulldown_4), 
+                        color=se_translation4)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 4"))) +
+      ylab(expression(log[10]("Expected pulldown 4"))) +
+      scale_color_viridis() +
+      labs(color = "SE (translation 4)") +
+      xlim(range4) + ylim(range4)
+     
+  } else if (beta_variable == 'delta_t'){
+    
+    pA = ggplot(df %>%
+                  filter(pulldown_12h_B1_norm != 0,
+                         expected_pulldown_1 != 0), 
+                aes(x=log10(pulldown_12h_B1_norm),
+                        y=log10(expected_pulldown_1), 
+                        color=se_delta_t1)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 1"))) +
+      ylab(expression(log[10]("Expected pulldown 1"))) +
+      scale_color_viridis() +
+      labs(color = "SE (delta T 1)") +
+      xlim(range1) + ylim(range1)
+    
+    pB = ggplot(df %>%
+                  filter(pulldown_12h_B2_norm != 0,
+                         expected_pulldown_2 != 0), 
+                aes(x=log10(pulldown_12h_B2_norm),
+                        y=log10(expected_pulldown_2), 
+                        color=se_delta_t2)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 2"))) +
+      ylab(expression(log[10]("Expected pulldown 2"))) +
+      scale_color_viridis() +
+      labs(color = "SE (delta T 2)") +
+      xlim(range2) + ylim(range2)
+    
+    pC = ggplot(df %>%
+                  filter(pulldown_12h_B3_norm != 0,
+                         expected_pulldown_3 != 0), 
+                aes(x=log10(pulldown_12h_B3_norm),
+                        y=log10(expected_pulldown_3), 
+                        color=se_delta_t3)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 3"))) +
+      ylab(expression(log[10]("Expected pulldown 3"))) +
+      scale_color_viridis() +
+      labs(color = "SE (delta T 3)") +
+      xlim(range3) + ylim(range3)
+    
+    pD = ggplot(df %>%
+                  filter(pulldown_12h_B4_norm != 0,
+                         expected_pulldown_4 != 0), 
+                aes(x=log10(pulldown_12h_B4_norm),
+                        y=log10(expected_pulldown_4), 
+                        color=se_delta_t4)) +
+      geom_point() + theme_light() +
+      xlab(expression(log[10]("Observed pulldown 4"))) +
+      ylab(expression(log[10]("Expected pulldown 4"))) +
+      scale_color_viridis() +
+      labs(color = "SE (delta T 4)") +
+      xlim(range4) + ylim(range4)
+    
+  }
+  
+  print(gridExtra::grid.arrange(pA, pB, pC, pD, nrow=2))
+  
 }
 
 
@@ -430,18 +716,45 @@ calculate_prec_mean_and_se_diploid = function(df){
     rowwise() %>%
     
     # Calculate precision-weighted mean and SE 
-    mutate(num = sum((log2_diploid_fc1)/(se_log2_diploid_1^2), 
-                     (log2_diploid_fc2)/(se_log2_diploid_2^2), 
-                     (log2_diploid_fc3)/(se_log2_diploid_3^2), 
-                     (log2_diploid_fc4)/(se_log2_diploid_4^2)),
+    mutate(num = sum((log2_diploid_fc1)/(se_log2_diploid_fc1^2), 
+                     (log2_diploid_fc2)/(se_log2_diploid_fc2^2), 
+                     (log2_diploid_fc3)/(se_log2_diploid_fc3^2), 
+                     (log2_diploid_fc4)/(se_log2_diploid_fc4^2)),
            
-           denom = sum(1/(se_log2_diploid_1^2), 
-                       1/(se_log2_diploid_2^2), 
-                       1/(se_log2_diploid_3^2), 
-                       1/(se_log2_diploid_4^2))) %>%
+           denom = sum(1/(se_log2_diploid_fc1^2), 
+                       1/(se_log2_diploid_fc2^2), 
+                       1/(se_log2_diploid_fc3^2), 
+                       1/(se_log2_diploid_fc4^2))) %>%
     
     mutate(pw_mean_log2_diploid = (num/denom),
            pw_se_log2_diploid = sqrt(1/denom)) %>%
+    
+    select(-num, -denom) %>%
+    ungroup()
+  
+  return(df)
+  
+}
+
+calculate_prec_mean_and_se_translation = function(df){
+  
+  df = df %>%
+    
+    rowwise() %>%
+    
+    # Calculate precision-weighted mean and SE 
+    mutate(num = sum((translation1)/(se_translation1^2), 
+                     (translation2)/(se_translation2^2), 
+                     (translation3)/(se_translation3^2), 
+                     (translation4)/(se_translation4^2)),
+           
+           denom = sum(1/(se_translation1^2), 
+                       1/(se_translation2^2), 
+                       1/(se_translation3^2), 
+                       1/(se_translation4^2))) %>%
+    
+    mutate(pw_mean_translation = (num/denom),
+           pw_se_translation = sqrt(1/denom)) %>%
     
     select(-num, -denom) %>%
     ungroup()
@@ -456,18 +769,18 @@ calculate_prec_mean_and_se_delta_t = function(df){
     
     rowwise() %>%
     
-    mutate(num = sum(log2_delta_t1/(se_log2_delta_t1^2), 
-                     log2_delta_t2/(se_log2_delta_t2^2), 
-                     log2_delta_t3/(se_log2_delta_t3^2), 
-                     log2_delta_t4/(se_log2_delta_t4^2)),
+    mutate(num = sum(delta_t1/(se_delta_t1^2), 
+                     delta_t2/(se_delta_t2^2), 
+                     delta_t3/(se_delta_t3^2), 
+                     delta_t4/(se_delta_t4^2)),
            
-           denom = sum(1/(se_log2_delta_t1^2), 
-                       1/(se_log2_delta_t2^2), 
-                       1/(se_log2_delta_t3^2), 
-                       1/(se_log2_delta_t4^2))) %>%
+           denom = sum(1/(se_delta_t1^2), 
+                       1/(se_delta_t2^2), 
+                       1/(se_delta_t3^2), 
+                       1/(se_delta_t4^2))) %>%
     
-    mutate(pw_mean_log2_delta_t = num/denom,
-           pw_se_log2_delta_t = sqrt(1/denom)) %>%
+    mutate(pw_mean_delta_t = num/denom,
+           pw_se_delta_t = sqrt(1/denom)) %>%
     
     select(-num, -denom) %>%
     ungroup()
@@ -488,7 +801,8 @@ run_ash = function(df, n_categories, mean_col, se_col,
     
     ash_results = 
       ash(df[,mean_col], df[,se_col],
-          mixcompdist = 'halfnormal', pointmass=TRUE, pi_thresh=0)
+          mixcompdist = 'normal', pi_thresh=0, pointmass=TRUE,
+          mode='estimate')
     
     ash_results_df = ash_results$result
     ash_results_df = ash_results_df[,c('PosteriorMean', 'PosteriorSD')]
@@ -500,16 +814,16 @@ run_ash = function(df, n_categories, mean_col, se_col,
   } else if (n_categories == 4){
     
     # Categories 
-    categories = unique(na.omit(df$predicted_category4))
+    categories = unique(na.omit(df$predicted_category))
     
     # Run ash within each category 
     for (category in categories){
       
       # Subset variants in category 
       tmp_df = df %>%
-        filter(predicted_category4 == category)
+        filter(predicted_category == category)
       
-      if (category == 'Total loss'){
+      if (category %in% c('Total loss')){
         
         # Run ash 
         ash_results = 
@@ -538,7 +852,48 @@ run_ash = function(df, n_categories, mean_col, se_col,
       }
     }
     
-  }
+  } 
+  
+  return(df_post_ash)
+  
+}
+
+run_ash_delta_t = function(df, n_categories, mean_col, se_col, 
+                           posterior_mean_col, posterior_sd_col){
+  
+  df = data.frame(df)
+  
+  if (n_categories == 4){
+    
+    # Categories 
+    categories = unique(na.omit(df$predicted_category))
+    
+    # Run ash within each category 
+    for (category in categories){
+      
+      # Subset variants in category 
+      tmp_df = df %>%
+        filter(predicted_category == category)
+      
+      # Run ash 
+      ash_results = 
+        ash(tmp_df[,mean_col], tmp_df[,se_col],
+            mixcompdist = 'normal', mode='estimate')
+      
+      ash_results_df = ash_results$result
+      ash_results_df = ash_results_df[,c('PosteriorMean', 'PosteriorSD')]
+      names(ash_results_df) = c(posterior_mean_col, posterior_sd_col)
+      
+      df_merged_results = cbind(tmp_df, ash_results_df)
+      
+      if (category == categories[1]){
+        df_post_ash = df_merged_results
+      } else {
+        df_post_ash = rbind(df_post_ash, df_merged_results)
+      }
+    }
+    
+  } 
   
   return(df_post_ash)
   
@@ -550,13 +905,15 @@ plot_pre_vs_post_ash_scatter = function(df, beta){
   
   if (beta == 'diploid'){
     
+    range = range(c(df$pw_mean_log2_diploid, df$ash_posterior_mean_log2_diploid))
+    
     pA = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=pw_mean_log2_diploid, y=ash_posterior_mean_log2_diploid, 
                     color=pw_se_log2_diploid)) +
       geom_abline(intercept = 0, slope = 1, linetype='dashed', color='grey') +
       geom_point(alpha=0.5) + 
-      facet_wrap(~predicted_category4, nrow=1) +
+      facet_wrap(~predicted_category, nrow=1) +
       theme_light() +
       theme(axis.text = element_text(size=14),
             axis.title = element_text(size=14),
@@ -565,19 +922,32 @@ plot_pre_vs_post_ash_scatter = function(df, beta){
             strip.text = element_text(size=14, color='white'),
             strip.background = element_rect(fill = "black", color = "black")) +
       scale_color_viridis() +
-      xlab(expression(paste("Pre-ash log"[2]*"(diploid FC)"))) +
+      xlab(expression(paste("Pre-ash precision-weighted log"[2]*"(diploid FC)"))) +
       ylab(expression(paste("Post-ash log"[2]*"(diploid FC)"))) +
-      labs(color = "SE (pre-ash)")
+      labs(color = "SE (pre-ash)") + 
+      xlim(range) + ylim(range)
     
   } else if (beta == 'delta_t'){
     
+    df = df %>%
+      rowwise() %>%
+      mutate(mean_log2_delta_t = sum(log2(delta_t1),
+                                     log2(delta_t2),
+                                     log2(delta_t3),
+                                     log2(delta_t4))/4) %>%
+      ungroup() %>%
+      mutate(mean_log2_delta_t = ifelse(mean_log2_delta_t == -Inf,
+                                        NA, mean_log2_delta_t))
+    
+    range = range(na.omit(c(df$mean_log2_delta_t, df$ash_posterior_mean_log2_delta_t)))
+    
     pA = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
-                aes(x=pw_mean_log2_delta_t, y=ash_posterior_mean_log2_delta_t, 
-                    color=pw_se_log2_delta_t)) +
+                  filter(is.na(predicted_category) == FALSE), 
+                aes(x=mean_log2_delta_t, y=ash_posterior_mean_log2_delta_t, 
+                    color=pw_se_log2_diploid)) +
       geom_abline(intercept = 0, slope = 1, linetype='dashed', color='grey') +
       geom_point(alpha=0.5) + 
-      facet_wrap(~predicted_category4, nrow=1) +
+      facet_wrap(~predicted_category, nrow=1) +
       theme_light() +
       theme(axis.text = element_text(size=14),
             axis.title = element_text(size=14),
@@ -586,17 +956,96 @@ plot_pre_vs_post_ash_scatter = function(df, beta){
             strip.text = element_text(size=14, color='white'),
             strip.background = element_rect(fill = "black", color = "black")) +
       scale_color_viridis() +
-      xlab(expression(paste("Pre-ash log"[2]*" "*Delta*" T"))) +
+      xlab(expression(paste("Pre-ash mean log"[2]*" "*Delta*" T"))) +
       ylab(expression(paste("Post-ash log"[2]*" "*Delta*" T"))) +
-      labs(color = "SE (pre-ash)")
+      labs(color = "SE diploid\n(pre-ash)") +
+      xlim(range) + ylim(range)
+
+  } else if (beta == 'translation'){
     
-    range = range(df$pw_mean_log2_delta_t)
-    pB = pA + ylim(range)
+    range = range(c(df$pw_mean_translation, df$ash_posterior_mean_translation))
     
-    print(pB)
-  } 
+    pA = ggplot(df, 
+                aes(x=pw_mean_translation, y=ash_posterior_mean_translation, 
+                    color=pw_se_translation)) +
+      geom_abline(intercept = 0, slope = 1, linetype='dashed', color='grey') +
+      geom_point(alpha=0.5) + 
+      facet_wrap(~translation_category, nrow=1) +
+      theme_light() +
+      theme(axis.text = element_text(size=14),
+            axis.title = element_text(size=14),
+            legend.text = element_text(size=12),
+            legend.title = element_text(size=14),
+            strip.text = element_text(size=14, color='white'),
+            strip.background = element_rect(fill = "black", color = "black")) +
+      scale_color_viridis() +
+      xlab("Pre-ash precision-weighted translation") +
+      ylab("Post-ash translation") +
+      labs(color = "SE (pre-ash)") + 
+      xlim(range) + ylim(range)
+    
+  } else if (beta == 'delta_t_new'){
+  
+    range <- range(na.omit(c((df$pw_mean_delta_t), 
+                             (df$ash_posterior_mean_delta))))
+    
+    pA = ggplot(df %>%
+                  filter(is.na(predicted_category) == FALSE) %>%
+                  filter(pw_mean_delta_t != 0,
+                         ash_posterior_mean_delta != 0), 
+                aes(x=(pw_mean_delta_t), y=(ash_posterior_mean_delta), 
+                    color=pw_se_delta_t)) +
+      geom_abline(intercept = 0, slope = 1, linetype='dashed', color='grey') +
+      geom_point(alpha=0.5) + 
+      facet_wrap(~predicted_category, nrow=1) +
+      theme_light() +
+      theme(axis.text = element_text(size=14),
+            axis.title = element_text(size=14),
+            legend.text = element_text(size=12),
+            legend.title = element_text(size=14),
+            strip.text = element_text(size=14, color='white'),
+            strip.background = element_rect(fill = "black", color = "black")) +
+      scale_color_viridis() +
+      xlab(expression(paste("(Pre-ash mean "*Delta*" T)"))) +
+      ylab(expression(paste("(Post-ash mean "*Delta*" T)"))) +
+      labs(color = "SE delta T\n(pre-ash)") +
+      xlim(range) + ylim(range)
+    
+    print(pA)
+    print(pA + xlim(c(0, 5)) + ylim(c(0, 5)))
+    
+  } else if (beta == 'log2_delta_t'){
+    
+    range <- range(na.omit(c(log2(df$pw_mean_delta_t[df$pw_mean_delta_t > 0]), 
+                             log2(df$ash_posterior_mean_delta[df$ash_posterior_mean_delta > 0]))))
+    
+    pA = ggplot(df %>%
+                  filter(is.na(predicted_category) == FALSE) %>%
+                  filter(pw_mean_delta_t != 0,
+                         ash_posterior_mean_delta != 0), 
+                aes(x=log2(pw_mean_delta_t), y=log2(ash_posterior_mean_delta), 
+                    color=pw_se_delta_t)) +
+      geom_abline(intercept = 0, slope = 1, linetype='dashed', color='grey') +
+      geom_point(alpha=0.5) + 
+      facet_wrap(~predicted_category, nrow=1) +
+      theme_light() +
+      theme(axis.text = element_text(size=14),
+            axis.title = element_text(size=14),
+            legend.text = element_text(size=12),
+            legend.title = element_text(size=14),
+            strip.text = element_text(size=14, color='white'),
+            strip.background = element_rect(fill = "black", color = "black")) +
+      scale_color_viridis() +
+      xlab(expression(paste("log"[2]*" (Pre-ash mean "*Delta*" T)"))) +
+      ylab(expression(paste("log"[2]*" (Post-ash mean "*Delta*" T)"))) +
+      labs(color = "SE delta T\n(pre-ash)") +
+      xlim(range) + ylim(range)
+    
+  }
   
   print(pA)
+  
+  return(pA)
   
 }
 
@@ -604,11 +1053,14 @@ plot_pre_and_post_ash_distributions = function(df, beta){
   
   if (beta == 'diploid'){
     
+    range_x = range(na.omit(
+      c(df$pw_mean_log2_diploid, df$ash_posterior_mean_log2_diploid)))
+    
     pA = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=pw_mean_log2_diploid)) +
       geom_density() + 
-      facet_wrap(~predicted_category4, nrow=1, scales='free') +
+      facet_wrap(~predicted_category, nrow=1, scales='free_y') +
       theme_light() +
       theme(axis.text = element_text(size=12),
             axis.title = element_text(size=12),
@@ -618,13 +1070,14 @@ plot_pre_and_post_ash_distributions = function(df, beta){
             strip.text = element_text(size=14, color='white'),
             strip.background = element_rect(fill = "black", color = "black")) +
       ggtitle("Pre-Ash") +
-      xlab(expression(paste("Precision-weighted mean log"[2]*"(diploid FC)")))
+      xlab(expression(paste("Precision-weighted mean log"[2]*"(diploid FC)"))) +
+      xlim(range_x)
     
     pB = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=ash_posterior_mean_log2_diploid)) +
       geom_density() + 
-      facet_wrap(~predicted_category4, nrow=1, scales='free') +
+      facet_wrap(~predicted_category, nrow=1, scales='free_y') +
       theme_light() +
       theme(axis.text = element_text(size=12),
             axis.title = element_text(size=12),
@@ -634,17 +1087,31 @@ plot_pre_and_post_ash_distributions = function(df, beta){
             strip.text = element_text(size=14, color='white'),
             strip.background = element_rect(fill = "black", color = "black")) +
       ggtitle("Post-Ash") +
-      xlab(expression(paste("Ash posterior log"[2]*"(diploid FC)")))
+      xlab(expression(paste("Ash posterior log"[2]*"(diploid FC)"))) +
+      xlim(range_x)
     
     gridExtra::grid.arrange(pA, pB, nrow=2)
     
   } else if (beta == 'delta_t'){
     
+    df = df %>%
+      rowwise() %>%
+      mutate(mean_log2_delta_t = sum(log2(delta_t1),
+                                     log2(delta_t2),
+                                     log2(delta_t3),
+                                     log2(delta_t4))/4) %>%
+      mutate(mean_log2_delta_t = ifelse(mean_log2_delta_t == -Inf,
+                                        NA, mean_log2_delta_t)) %>%
+      ungroup()
+    
+    range_x = range(na.omit(
+      c(df$mean_log2_delta_t, df$ash_posterior_mean_log2_delta_t)))
+    
     pA = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
-                aes(x=pw_mean_log2_delta_t)) +
+                  filter(is.na(predicted_category) == FALSE), 
+                aes(x=mean_log2_delta_t)) +
       geom_density() + 
-      facet_wrap(~predicted_category4, nrow=1, scales='free') +
+      facet_wrap(~predicted_category, nrow=1, scales='free_y') +
       theme_light() +
       theme(axis.text = element_text(size=12),
             axis.title = element_text(size=12),
@@ -654,13 +1121,14 @@ plot_pre_and_post_ash_distributions = function(df, beta){
             strip.text = element_text(size=14, color='white'),
             strip.background = element_rect(fill = "black", color = "black")) +
       ggtitle("Pre-Ash") +
-      xlab(expression(paste("Precision-weighted mean log"[2]*" "*Delta*" T")))
+      xlab(expression(paste("Mean log"[2]*" "*Delta*" T"))) +
+      xlim(range_x)
     
     pB = ggplot(df %>%
-                  filter(is.na(predicted_category4) == FALSE), 
+                  filter(is.na(predicted_category) == FALSE), 
                 aes(x=ash_posterior_mean_log2_delta_t)) +
       geom_density() + 
-      facet_wrap(~predicted_category4, nrow=1, scales='free') +
+      facet_wrap(~predicted_category, nrow=1, scales='free_y') +
       theme_light() +
       theme(axis.text = element_text(size=12),
             axis.title = element_text(size=12),
@@ -670,92 +1138,164 @@ plot_pre_and_post_ash_distributions = function(df, beta){
             strip.text = element_text(size=14, color='white'),
             strip.background = element_rect(fill = "black", color = "black")) +
       ggtitle("Post-Ash") +
-      xlab(expression(paste("Ash posterior mean log"[2]*" "*Delta*" T")))
+      xlab(expression(paste("Ash posterior mean log"[2]*" "*Delta*" T"))) +
+      xlim(range_x)
     
     gridExtra::grid.arrange(pA, pB, nrow=2)
     
+  } else if (beta == 'translation'){
+    
+    range_x = range(na.omit(
+      c(df$pw_mean_translation, df$ash_posterior_mean_translation)))
+    
+    pA = ggplot(df,
+                aes(x=pw_mean_translation)) +
+      geom_density() + 
+      theme_light() +
+      facet_wrap(~translation_category, nrow=1, scales='free_y') +
+      theme(axis.text = element_text(size=12),
+            axis.title = element_text(size=12),
+            legend.text = element_text(size=12),
+            legend.title = element_text(size=14),
+            plot.title = element_text(size=16, hjust=0.5, face='bold'),
+            strip.text = element_text(size=14, color='white'),
+            strip.background = element_rect(fill = "black", color = "black")) +
+      ggtitle("Pre-Ash") +
+      xlab("Precision-weighted mean translation") +
+      xlim(range_x)
+    
+    pB = ggplot(df, 
+                aes(x=ash_posterior_mean_translation)) +
+      geom_density() + 
+      facet_wrap(~translation_category, nrow=1, scales='free_y') +
+      theme_light() +
+      theme(axis.text = element_text(size=12),
+            axis.title = element_text(size=12),
+            legend.text = element_text(size=12),
+            legend.title = element_text(size=14),
+            plot.title = element_text(size=16, hjust=0.5, face='bold'),
+            strip.text = element_text(size=14, color='white'),
+            strip.background = element_rect(fill = "black", color = "black")) +
+      ggtitle("Post-Ash") +
+      xlab("Ash posterior mean translation") +
+      xlim(range_x)
+    
+    gridExtra::grid.arrange(pA, pB, nrow=2)
+    
+  } else if (beta == 'delta_t_new'){
+    
+    range_x = range(na.omit(
+      c(df$pw_mean_delta_t, df$ash_posterior_mean_delta)))
+    
+    pA = ggplot(df %>%
+                  filter(is.na(predicted_category) == FALSE), 
+                aes(x=pw_mean_delta_t)) +
+      geom_density() + 
+      facet_wrap(~predicted_category, nrow=1, scales='free_y') +
+      theme_light() +
+      theme(axis.text = element_text(size=12),
+            axis.title = element_text(size=12),
+            legend.text = element_text(size=12),
+            legend.title = element_text(size=14),
+            plot.title = element_text(size=16, hjust=0.5, face='bold'),
+            strip.text = element_text(size=14, color='white'),
+            strip.background = element_rect(fill = "black", color = "black")) +
+      ggtitle("Pre-Ash") +
+      xlab(expression(paste(Delta, " T"))) +
+      xlim(range_x)
+    
+    pB = ggplot(df %>%
+                  filter(is.na(predicted_category) == FALSE), 
+                aes(x=ash_posterior_mean_delta)) +
+      geom_density() + 
+      facet_wrap(~predicted_category, nrow=1, scales='free_y') +
+      theme_light() +
+      theme(axis.text = element_text(size=12),
+            axis.title = element_text(size=12),
+            legend.text = element_text(size=12),
+            legend.title = element_text(size=14),
+            plot.title = element_text(size=16, hjust=0.5, face='bold'),
+            strip.text = element_text(size=14, color='white'),
+            strip.background = element_rect(fill = "black", color = "black")) +
+      ggtitle("Post-Ash") +
+      xlab(expression(paste("Ash posterior mean ", Delta, " T"))) +
+      xlim(range_x)
+    
+    gridExtra::grid.arrange(pA, pB, nrow=2)
+    
+    range_x = c(0,10)
+    gridExtra::grid.arrange(pA + xlim(range_x), 
+                            pB + xlim(range_x), nrow=2)
+    
   }
+  
 }
 
 
-# Leave-one-out validation
-calculate_prec_mean_and_se_3replicates = function(df, beta){
+# Diploid
+calculate_prec_mean_and_se_3replicates_diploid = function(df, replicate_n) {
   
-  if (beta == 'diploid'){
+  all_replicates = c(1:4)
+  replicates = setdiff(all_replicates, replicate_n)
+  
+  # Calculate weighted-means 
+  df = df %>%
+    mutate(pw_fc1 = log2_diploid_fc1 / (se_log2_diploid_fc1^2),
+           pw_fc2 = log2_diploid_fc2 / (se_log2_diploid_fc2^2),
+           pw_fc3 = log2_diploid_fc3 / (se_log2_diploid_fc3^2),
+           pw_fc4 = log2_diploid_fc4 / (se_log2_diploid_fc4^2),
+           
+           pw_se_fc1 = 1 / (se_log2_diploid_fc1^2), 
+           pw_se_fc2 = 1 / (se_log2_diploid_fc2^2), 
+           pw_se_fc3 = 1 / (se_log2_diploid_fc3^2), 
+           pw_se_fc4 = 1 / (se_log2_diploid_fc4^2))
+  
+  # Calculate precision-weighted mean
+  df = df %>%
     
-    df = df %>%
-      
-      rowwise() %>%
-      
-      # Calculate precision-weighted mean and SE 
-      mutate(num = sum((log2_diploid_fc1)/(se_log2_diploid_1^2), 
-                       (log2_diploid_fc2)/(se_log2_diploid_2^2), 
-                       (log2_diploid_fc3)/(se_log2_diploid_3^2)),
-             
-             denom = sum(1/(se_log2_diploid_1^2), 
-                         1/(se_log2_diploid_2^2), 
-                         1/(se_log2_diploid_3^2))) %>%
-      
-      mutate(pw_mean_3reps = (num/denom),
-             pw_se_3reps = sqrt(1/denom)) %>%
-      
-      mutate(mean_3reps = sum(log2_diploid_fc1 +
-                                log2_diploid_fc2 +
-                                log2_diploid_fc3)/3) %>%
-      
-      select(-num, -denom) %>%
-      ungroup()
+    # Calculate precision-weighted mean and SE 
+    mutate(num = rowSums(select(., starts_with('pw_fc'))[replicates]),
+           denom = rowSums(select(., starts_with('pw_se_fc'))[replicates])) %>%
     
-  } else if (beta == 'delta_t'){
+    mutate(pw_mean_3reps = (num/denom),
+           pw_se_3reps = sqrt(1/denom)) %>%
     
-    df = df %>%
-      
-      rowwise() %>%
-      
-      # Calculate precision-weighted mean and SE 
-      mutate(num = sum((log2_delta_t1)/(se_log2_delta_t1^2), 
-                       (log2_delta_t2)/(se_log2_delta_t2^2), 
-                       (log2_delta_t3)/(se_log2_delta_t3^2)),
-             
-             denom = sum(1/(se_log2_delta_t1^2), 
-                         1/(se_log2_delta_t2^2), 
-                         1/(se_log2_delta_t3^2))) %>%
-      
-      mutate(pw_mean_3reps = (num/denom),
-             pw_se_3reps = sqrt(1/denom)) %>%
-      
-      mutate(mean_3reps = sum(log2_delta_t1 +
-                                log2_delta_t2 +
-                                log2_delta_t3)/3) %>%
-      
-      select(-num, -denom) %>%
-      ungroup()
+    select(-num, -denom,
+           -starts_with("pw_fc"), -starts_with("pw_se_fc")) %>%
     
-  }
+    ungroup() 
   
   return(df)
   
 }
 
-leave_one_out_validation = function(df, beta, rep_4_colname){
+leave_one_out_validation_diploid = function(df, replicate_n) {
   
-  df_4replicates = df
+  all_replicates = c(1:4)
+  replicates = setdiff(all_replicates, replicate_n)
   
-  df_3replicates = calculate_prec_mean_and_se_3replicates(df, 'diploid')
-  df_3replicates = run_ash(df_3replicates, n_categories=4, 
+  rep_colname = paste('log2_diploid_fc', replicate_n, sep='')
+  
+  # Run ash on the remaining 3 replicates
+  df_3replicates = calculate_prec_mean_and_se_3replicates_diploid(df, replicate_n)
+  
+  df_3replicates = run_ash(df_3replicates, n_categories = 4, 
                            'pw_mean_3reps', 'pw_se_3reps',
-                           'ash_posterior_mean_3reps', 'ash_posterior_sd_3reps')
+                           'ash_posterior_mean_3reps',
+                           'ash_posterior_sd_3reps')
   
-  if (beta == 'delta_t'){
-   
-    df_3replicates = transform_diploid_to_haploid(df_3replicates,
-                                                  'ash_posterior_mean_3reps',
-                                                  'ash_posterior_sd_3reps', all_reps=FALSE)
-  }
+  # Calculate the simple mean of the remaining 3 replicates
+  replicate_cols = paste('log2_diploid_fc', replicates, sep='')
   
-  df_validate = merge(df_4replicates %>%
-                        rename(replicate_4 = rep_4_colname) %>%
-                        select(humvar, replicate_4),
+  df_3replicates = df_3replicates %>%
+    rowwise() %>%
+    mutate(mean_3reps = mean(c_across(all_of(replicate_cols)))) %>%
+    ungroup()
+  
+  # Merge data from all 4 replicates and data from the 3 replicates
+  df_validate = merge(df %>%
+                        rename(replicate = rep_colname) %>%
+                        select(humvar, replicate),
                       
                       df_3replicates %>%
                         rename(simple_mean_3reps='mean_3reps') %>%
@@ -763,71 +1303,556 @@ leave_one_out_validation = function(df, beta, rep_4_colname){
                                ash_posterior_mean_3reps, 
                                simple_mean_3reps), by='humvar')
   
+  # Calculate means in 100 bins
   df_validate = df_validate %>%
     mutate(bins = ntile(ash_posterior_mean_3reps, 100)) %>%
     
     group_by(bins) %>%
-    mutate(mean_ash_posterior_3reps = 2^mean(ash_posterior_mean_3reps),
-           mean_replicate_4 = 2^mean(replicate_4),
-           mean_3reps = 2^mean(simple_mean_3reps)) %>%
-    ungroup()
+    mutate(mean_ash_posterior_3reps = mean(ash_posterior_mean_3reps),
+           mean_replicate = mean(replicate),
+           mean_3reps = mean(simple_mean_3reps)) %>%
+    ungroup() %>%
+    
+    select(mean_ash_posterior_3reps,
+           mean_replicate,
+           mean_3reps) %>%
+    
+    distinct()
   
   mse1 = mean((df_validate$mean_ash_posterior_3reps - 
-                 df_validate$mean_replicate_4)^2)
+                 df_validate$mean_replicate)^2)
   
   mse2 = mean((df_validate$mean_3reps - 
-                 df_validate$mean_replicate_4)^2)
+                 df_validate$mean_replicate)^2)
   
   range = range(c(df_validate$mean_ash_posterior_3reps, 
                   df_validate$mean_3reps,
-                  df_validate$mean_replicate_4))
-
-  pA = ggplot(df_validate, aes(x=mean_ash_posterior_3reps, y=mean_replicate_4)) +
-    geom_point() + geom_abline(slope=1) +
+                  df_validate$mean_replicate))
+  
+  # Calculate correlations and bias
+  pearson_r1 = round(cor(df_validate$mean_ash_posterior_3reps, 
+                         df_validate$mean_replicate), 2)
+  spearman_rho1 = round(cor(df_validate$mean_ash_posterior_3reps, 
+                            df_validate$mean_replicate, method = "spearman"), 2)
+  bias1 = round(mean(df_validate$mean_replicate - 
+                       df_validate$mean_ash_posterior_3reps), 2)
+  
+  pearson_r2 = round(cor(df_validate$mean_3reps, 
+                         df_validate$mean_replicate), 2)
+  spearman_rho2 = round(cor(df_validate$mean_3reps, 
+                            df_validate$mean_replicate, method = "spearman"), 2)
+  bias2 = round(mean(df_validate$mean_replicate - 
+                       df_validate$mean_3reps), 2)
+  
+  # Plot pA
+  pA = ggplot(df_validate, aes(x = mean_ash_posterior_3reps, 
+                               y = mean_replicate)) +
+    geom_point() + geom_abline(slope = 1) +
     ggtitle(str_interp("MSE = ${round(mse1, 4)}")) +
     theme_light() +
-    theme(axis.text = element_text(size=14),
-          axis.title = element_text(size=14),
-          plot.title = element_text(size=16, face='bold', hjust=0.5)) +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(size = 16, face = 'bold', hjust = 0.5)) +
     xlab("Mean ash posterior (3 replicates)") +
-    ylab("Mean replicate 4") +
-    xlim(range) + ylim(range)
+    ylab(str_interp("Mean replicate ${replicate_n}")) +
+    xlim(range) + ylim(range) +
+    annotate("text", 
+             x = max(range),
+             y = min(range) * 0.85,
+             label = str_interp("Pearson r = ${pearson_r1}\nSpearman rho = ${spearman_rho1}\nBias = ${bias1}"),
+             hjust = 1, size = 5, color = '#840000')
   
-  pB = ggplot(df_validate, aes(x=mean_3reps, y=mean_replicate_4)) +
-    geom_point() + geom_abline(slope=1) +
+  # Plot pB
+  pB = ggplot(df_validate, aes(x = mean_3reps, y = mean_replicate)) +
+    geom_point() + geom_abline(slope = 1) +
     ggtitle(str_interp("MSE = ${round(mse2, 4)}")) +
     theme_light() +
-    theme(axis.text = element_text(size=14),
-          axis.title = element_text(size=14),
-          plot.title = element_text(size=16, face='bold', hjust=0.5)) +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(size = 16, face = 'bold', hjust = 0.5)) +
     xlab("Mean simple mean (3 replicates)") +
-    ylab("Mean replicate 4") +
-    xlim(range) + ylim(range)
+    ylab(str_interp("Mean replicate ${replicate_n}")) +
+    xlim(range) + ylim(range) +
+    annotate("text", 
+             x = max(range),
+             y = min(range) * 0.85,
+             label = str_interp("Pearson r = ${pearson_r2}\nSpearman rho = ${spearman_rho2}\nBias = ${bias2}"),
+             hjust = 1, size = 5, color = '#840000')
   
-  gridExtra::grid.arrange(pA, pB, nrow=1)
+  gridExtra::grid.arrange(pA, pB, nrow = 1)
   
 }
 
 
-#-----------------#
-# SPECIFICATIONS  #
-#-----------------#
-read_filter_spec = 0
-epsilon_spec = 1
-normalization_spec = 'rpm'
-reference_spec = 'reference'
-remove_input_0_spec = TRUE
+# Delta translation
+calculate_prec_mean_and_se_3replicates_delta_t = function(df, replicate_n) {
+  
+  all_replicates = c(1:4)
+  replicates = setdiff(all_replicates, replicate_n)
+  
+  # Calculate weighted-means 
+  df = df %>%
+    mutate(pw_fc1 = delta_t1 / (se_delta_t1^2),
+           pw_fc2 = delta_t2 / (se_delta_t2^2),
+           pw_fc3 = delta_t3 / (se_delta_t3^2),
+           pw_fc4 = delta_t4 / (se_delta_t4^2),
+           
+           pw_se_fc1 = 1 / (se_delta_t1^2), 
+           pw_se_fc2 = 1 / (se_delta_t2^2), 
+           pw_se_fc3 = 1 / (se_delta_t3^2), 
+           pw_se_fc4 = 1 / (se_delta_t4^2))
+  
+  # Calculate precision-weighted mean
+  df = df %>%
+    
+    # Calculate precision-weighted mean and SE 
+    mutate(num = rowSums(select(., starts_with('pw_fc'))[replicates]),
+           denom = rowSums(select(., starts_with('pw_se_fc'))[replicates])) %>%
+    
+    mutate(pw_mean_3reps = (num/denom),
+           pw_se_3reps = sqrt(1/denom)) %>%
+    
+    select(-num, -denom,
+           -starts_with("pw_fc"), -starts_with("pw_se_fc")) %>%
+    
+    ungroup() 
+  
+  return(df)
+  
+}
+
+leave_one_out_validation_delta_new = function(df, replicate_n) {
+  
+  all_replicates = c(1:4)
+  replicates = setdiff(all_replicates, replicate_n)
+  
+  rep_colname = paste('delta_t', replicate_n, sep='')
+  
+  # Run ash on the remaining 3 replicates
+  df_3replicates = calculate_prec_mean_and_se_3replicates_delta_t(df, replicate_n)
+  
+  df_3replicates = run_ash_delta_t(df_3replicates, n_categories = 4, 
+                                   'pw_mean_3reps', 'pw_se_3reps',
+                                   'ash_posterior_mean_3reps',
+                                   'ash_posterior_sd_3reps')
+  
+  # Calculate the simple mean of the remaining 3 replicates
+  replicate_cols = paste('delta_t', replicates, sep='')
+  
+  df_3replicates = df_3replicates %>%
+    rowwise() %>%
+    mutate(mean_3reps = mean(c_across(all_of(replicate_cols)))) %>%
+    ungroup()
+  
+  # Merge data from all 4 replicates and data from the 3 replicates
+  df_validate = merge(df %>%
+                        rename(replicate = rep_colname) %>%
+                        select(humvar, replicate),
+                      
+                      df_3replicates %>%
+                        rename(simple_mean_3reps='mean_3reps') %>%
+                        select(humvar, 
+                               ash_posterior_mean_3reps, 
+                               simple_mean_3reps), by='humvar')
+  
+  # Calculate means in 100 bins
+  df_validate = df_validate %>%
+    mutate(bins = ntile(ash_posterior_mean_3reps, 100)) %>%
+    
+    group_by(bins) %>%
+    mutate(mean_ash_posterior_3reps = mean(ash_posterior_mean_3reps),
+           mean_replicate = mean(replicate),
+           mean_3reps = mean(simple_mean_3reps)) %>%
+    ungroup() %>%
+    
+    select(mean_ash_posterior_3reps,
+           mean_replicate,
+           mean_3reps) %>%
+    
+    distinct()
+  
+  mse1 = mean((df_validate$mean_ash_posterior_3reps - 
+                 df_validate$mean_replicate)^2)
+  
+  mse2 = mean((df_validate$mean_3reps - 
+                 df_validate$mean_replicate)^2)
+  
+  range = range(c(df_validate$mean_ash_posterior_3reps, 
+                  df_validate$mean_3reps,
+                  df_validate$mean_replicate))
+  
+  # Calculate correlations and bias
+  pearson_r1 = round(cor(df_validate$mean_ash_posterior_3reps, 
+                         df_validate$mean_replicate), 2)
+  spearman_rho1 = round(cor(df_validate$mean_ash_posterior_3reps, 
+                            df_validate$mean_replicate, method = "spearman"), 2)
+  bias1 = round(mean(df_validate$mean_replicate - 
+                       df_validate$mean_ash_posterior_3reps), 2)
+  
+  pearson_r2 = round(cor(df_validate$mean_3reps, 
+                         df_validate$mean_replicate), 2)
+  spearman_rho2 = round(cor(df_validate$mean_3reps, 
+                            df_validate$mean_replicate, method = "spearman"), 2)
+  bias2 = round(mean(df_validate$mean_replicate - 
+                       df_validate$mean_3reps), 2)
+  
+  # Plot pA
+  pA = ggplot(df_validate, aes(x = mean_ash_posterior_3reps, 
+                               y = mean_replicate)) +
+    geom_point() + geom_abline(slope = 1) +
+    ggtitle(str_interp("MSE = ${round(mse1, 4)}")) +
+    theme_light() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(size = 16, face = 'bold', hjust = 0.5)) +
+    xlab("Mean ash posterior (3 replicates)") +
+    ylab(str_interp("Mean replicate ${replicate_n}")) +
+    xlim(range) + ylim(range) +
+    annotate("text", 
+             x = max(range),
+             y = 0.5,
+             label = str_interp("Pearson r = ${pearson_r1}\nSpearman rho = ${spearman_rho1}\nBias = ${bias1}"),
+             hjust = 1, size = 5, color = '#840000')
+  
+  # Plot pB
+  pB = ggplot(df_validate, aes(x = mean_3reps, y = mean_replicate)) +
+    geom_point() + geom_abline(slope = 1) +
+    ggtitle(str_interp("MSE = ${round(mse2, 4)}")) +
+    theme_light() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(size = 16, face = 'bold', hjust = 0.5)) +
+    xlab("Mean simple mean (3 replicates)") +
+    ylab(str_interp("Mean replicate ${replicate_n}")) +
+    xlim(range) + ylim(range) +
+    annotate("text", 
+             x = max(range),
+             y = 0.5,
+             label = str_interp("Pearson r = ${pearson_r2}\nSpearman rho = ${spearman_rho2}\nBias = ${bias2}"),
+             hjust = 1, size = 5, color = '#840000')
+  
+  gridExtra::grid.arrange(pA, pB, nrow = 1)
+  
+}
+
+
+# Translation
+transform_haploid_to_translation = function(df, 
+                                            ash_haploid_mean_colname, 
+                                            ash_haploid_se_colname, all_reps){
+  
+  df = df %>%
+    
+    rename(haploid=ash_haploid_mean_colname,
+           haploid_se=ash_haploid_se_colname) %>%
+    
+    # Calculate median translation for each gene
+    group_by(gene) %>%
+    mutate(median_pw_translation = median(pw_mean_translation)) %>%
+    ungroup() %>%
+    
+    # Naive transformation of diploid to haploid  
+    rowwise() %>%
+    mutate(naive_translation = haploid*median_pw_translation,
+           
+           # Second derivative of naive transformation 
+           d2_dx2_translation = 0,
+           
+           # Transformation
+           translation = naive_translation + 
+             0.5*d2_dx2_translation*(haploid^2 + haploid_se))
+  
+  if (all_reps){
+    
+    # Rename back to ash_posterior_mean_translation so it's compatible downstream
+    df = df %>%
+      rename(ash_posterior_mean_translation='translation',
+             
+             # Rename diploid colnames back 
+             ash_posterior_mean_delta='haploid',
+             ash_posterior_se_delta='haploid_se')
+    
+  } else {
+    
+    df = df %>%
+      rename(ash_posterior_mean_translation_3reps='translation')
+  }
+  
+  # Remove unnecessary columns
+  df = df %>%
+    select(-naive_translation, -d2_dx2_translation)
+  
+  return(df)
+  
+  
+}
+
+leave_one_out_validation_translation_transformed = function(df, replicate_n) {
+  
+  df = data.frame(df)
+  
+  all_replicates = c(1:4)
+  replicates = setdiff(all_replicates, replicate_n)
+  
+  rep_colname = paste('translation', replicate_n, sep='')
+  
+  # Run ash on the remaining 3 replicates
+  df_3replicates = 
+    calculate_prec_mean_and_se_3replicates_delta_t(df, replicate_n)
+  
+  df_3replicates = run_ash_delta_t(df_3replicates, n_categories = 4, 
+                                   'pw_mean_3reps', 'pw_se_3reps',
+                                   'ash_posterior_mean_3reps',
+                                   'ash_posterior_sd_3reps')
+  
+  df_3replicates = transform_haploid_to_translation(df_3replicates, 
+                                                    'ash_posterior_mean_3reps',
+                                                    'ash_posterior_sd_3reps', 
+                                                    all_reps=FALSE)
+  
+  # Calculate the simple mean of the remaining 3 replicates
+  replicate_cols = paste('translation', replicates, sep='')
+  
+  df_3replicates = df_3replicates %>%
+    rowwise() %>%
+    mutate(mean_3reps = mean(c_across(all_of(replicate_cols)))) %>%
+    ungroup()
+  
+  # Merge data from all 4 replicates and data from the 3 replicates
+  df_validate = merge(df %>%
+                        rename(replicate = rep_colname) %>%
+                        select(humvar, replicate),
+                      
+                      df_3replicates %>%
+                        rename(simple_mean_3reps='mean_3reps') %>%
+                        select(humvar, 
+                               ash_posterior_mean_translation_3reps, 
+                               simple_mean_3reps), by='humvar')
+  
+  # Calculate means in 100 bins
+  df_validate = df_validate %>%
+    mutate(bins = ntile(ash_posterior_mean_translation_3reps, 100)) %>%
+    
+    group_by(bins) %>%
+    mutate(mean_ash_posterior_3reps = mean(ash_posterior_mean_translation_3reps),
+           mean_replicate = mean(replicate),
+           mean_3reps = mean(simple_mean_3reps)) %>%
+    ungroup()
+  
+  mse1 = mean((df_validate$mean_ash_posterior_3reps - 
+                 df_validate$mean_replicate)^2)
+  
+  mse2 = mean((df_validate$mean_3reps - 
+                 df_validate$mean_replicate)^2)
+  
+  range = range(c(df_validate$mean_ash_posterior_3reps, 
+                  df_validate$mean_3reps,
+                  df_validate$mean_replicate))
+  
+  # Calculate correlations and bias
+  pearson_r1 <- round(cor(df_validate$mean_ash_posterior_3reps, 
+                          df_validate$mean_replicate), 2)
+  spearman_rho1 <- round(cor(df_validate$mean_ash_posterior_3reps, 
+                             df_validate$mean_replicate, method = "spearman"), 2)
+  bias1 <- round(mean(df_validate$mean_replicate - 
+                        df_validate$mean_ash_posterior_3reps), 2)
+  
+  pearson_r2 <- round(cor(df_validate$mean_3reps, 
+                          df_validate$mean_replicate), 2)
+  spearman_rho2 <- round(cor(df_validate$mean_3reps, 
+                             df_validate$mean_replicate, method = "spearman"), 2)
+  bias2 <- round(mean(df_validate$mean_replicate - 
+                        df_validate$mean_3reps), 2)
+  
+  # Plot pA
+  pA = ggplot(df_validate, aes(x = mean_ash_posterior_3reps, 
+                               y = mean_replicate)) +
+    geom_point() + geom_abline(slope = 1) +
+    ggtitle(str_interp("MSE = ${round(mse1, 4)}")) +
+    theme_light() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(size = 16, face = 'bold', hjust = 0.5)) +
+    xlab("Mean ash posterior (3 replicates)") +
+    ylab(str_interp("Mean replicate ${replicate_n}")) +
+    xlim(range) + ylim(range) +
+    annotate("text", 
+             x = max(range),
+             y = 0.5,
+             label = str_interp("Pearson r = ${pearson_r1}\nSpearman rho = ${spearman_rho1}\nBias = ${bias1}"),
+             hjust = 1, size = 5, color = '#840000')
+  
+  # Plot pB
+  pB = ggplot(df_validate, aes(x = mean_3reps, y = mean_replicate)) +
+    geom_point() + geom_abline(slope = 1) +
+    ggtitle(str_interp("MSE = ${round(mse2, 4)}")) +
+    theme_light() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(size = 16, face = 'bold', hjust = 0.5)) +
+    xlab("Mean simple mean (3 replicates)") +
+    ylab(str_interp("Mean replicate ${replicate_n}")) +
+    xlim(range) + ylim(range) +
+    annotate("text", 
+             x = max(range),
+             y = 0.5,
+             label = str_interp("Pearson r = ${pearson_r2}\nSpearman rho = ${spearman_rho2}\nBias = ${bias2}"),
+             hjust = 1, size = 5, color = '#840000')
+  
+  gridExtra::grid.arrange(pA, pB, nrow = 1)
+  
+}
+
+
+# Translation (precision-weighted)
+calculate_prec_mean_and_se_3replicates_translation = function(df, replicate_n) {
+  
+  all_replicates = c(1:4)
+  replicates = setdiff(all_replicates, replicate_n)
+  
+  # Calculate weighted-means 
+  df = df %>%
+    
+    mutate(pw_fc1 = translation1 / (se_translation1^2),
+           pw_fc2 = translation2 / (se_translation2^2),
+           pw_fc3 = translation3 / (se_translation3^2),
+           pw_fc4 = translation4 / (se_translation4^2),
+           
+           pw_se_fc1 = 1 / (se_translation1^2), 
+           pw_se_fc2 = 1 / (se_translation2^2), 
+           pw_se_fc3 = 1 / (se_translation3^2), 
+           pw_se_fc4 = 1 / (se_translation4^2))
+  
+  # Calculate precision-weighted mean
+  df = df %>%
+    
+    # Calculate precision-weighted mean and SE 
+    mutate(num = rowSums(select(., starts_with('pw_fc'))[replicates]),
+           denom = rowSums(select(., starts_with('pw_se_fc'))[replicates])) %>%
+    
+    mutate(pw_mean_3reps = (num/denom),
+           pw_se_3reps = sqrt(1/denom)) %>%
+    
+    select(-num, -denom,
+           -starts_with("pw_fc"), -starts_with("pw_se_fc")) %>%
+    
+    ungroup() 
+  
+  return(df)
+  
+}
+
+leave_one_out_validation_translation = function(df, replicate_n) {
+  
+  df = data.frame(df)
+  
+  all_replicates = c(1:4)
+  replicates = setdiff(all_replicates, replicate_n)
+  
+  rep_colname = paste('translation', replicate_n, sep='')
+  
+  # Run ash on the remaining 3 replicates
+  df_3replicates = 
+    calculate_prec_mean_and_se_3replicates_translation(df, replicate_n)
+  
+  # Calculate the simple mean of the remaining 3 replicates
+  replicate_cols = paste('translation', replicates, sep='')
+  
+  df_3replicates = df_3replicates %>%
+    rowwise() %>%
+    mutate(mean_3reps = mean(c_across(all_of(replicate_cols)))) %>%
+    ungroup()
+  
+  # Merge data from all 4 replicates and data from the 3 replicates
+  df_validate = merge(df %>%
+                        rename(replicate = rep_colname) %>%
+                        select(humvar, replicate),
+                      
+                      df_3replicates %>%
+                        rename(simple_mean_3reps='mean_3reps') %>%
+                        select(humvar, 
+                               pw_mean_3reps, 
+                               simple_mean_3reps), by='humvar')
+  
+  # Calculate means in 100 bins
+  df_validate = df_validate %>%
+    mutate(bins = ntile(pw_mean_3reps, 100)) %>%
+    
+    group_by(bins) %>%
+    mutate(mean_pw_3reps = mean(pw_mean_3reps),
+           mean_replicate = mean(replicate),
+           mean_3reps = mean(simple_mean_3reps)) %>%
+    ungroup()
+  
+  mse1 = mean((df_validate$mean_pw_3reps - 
+                 df_validate$mean_replicate)^2)
+  
+  mse2 = mean((df_validate$mean_3reps - 
+                 df_validate$mean_replicate)^2)
+  
+  range = range(c(df_validate$mean_pw_3reps, 
+                  df_validate$mean_3reps,
+                  df_validate$mean_replicate))
+  
+  # Calculate correlations and bias
+  pearson_r1 <- round(cor(df_validate$mean_pw_3reps, 
+                          df_validate$mean_replicate), 2)
+  spearman_rho1 <- round(cor(df_validate$mean_pw_3reps, 
+                             df_validate$mean_replicate, method = "spearman"), 2)
+  bias1 <- round(mean(df_validate$mean_replicate - 
+                        df_validate$mean_pw_3reps), 2)
+  
+  pearson_r2 <- round(cor(df_validate$mean_3reps, 
+                          df_validate$mean_replicate), 2)
+  spearman_rho2 <- round(cor(df_validate$mean_3reps, 
+                             df_validate$mean_replicate, method = "spearman"), 2)
+  bias2 <- round(mean(df_validate$mean_replicate - 
+                        df_validate$mean_3reps), 2)
+  
+  # Plot pA
+  pA = ggplot(df_validate, aes(x = mean_pw_3reps, 
+                               y = mean_replicate)) +
+    geom_point() + geom_abline(slope = 1) +
+    ggtitle(str_interp("MSE = ${round(mse1, 4)}")) +
+    theme_light() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(size = 16, face = 'bold', hjust = 0.5)) +
+    xlab("Mean precision-weighted mean (3 replicates)") +
+    ylab(str_interp("Mean replicate ${replicate_n}")) +
+    xlim(range) + ylim(range) +
+    annotate("text", 
+             x = max(range),
+             y = 0.5,
+             label = str_interp("Pearson r = ${pearson_r1}\nSpearman rho = ${spearman_rho1}\nBias = ${bias1}"),
+             hjust = 1, size = 5, color = '#840000')
+  
+  # Plot pB
+  pB = ggplot(df_validate, aes(x = mean_3reps, y = mean_replicate)) +
+    geom_point() + geom_abline(slope = 1) +
+    ggtitle(str_interp("MSE = ${round(mse2, 4)}")) +
+    theme_light() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          plot.title = element_text(size = 16, face = 'bold', hjust = 0.5)) +
+    xlab("Mean simple mean (3 replicates)") +
+    ylab(str_interp("Mean replicate ${replicate_n}")) +
+    xlim(range) + ylim(range) +
+    annotate("text", 
+             x = max(range),
+             y = 0.5,
+             label = str_interp("Pearson r = ${pearson_r2}\nSpearman rho = ${spearman_rho2}\nBias = ${bias2}"),
+             hjust = 1, size = 5, color = '#840000')
+  
+  gridExtra::grid.arrange(pA, pB, nrow = 1)
+  
+}
 
 
 #------------#
 # VARIABLES  #
 #------------#
 n_bins = 100
-
-coef_matrix = matrix(c(9/16, 1/16, 1/16, 1/16,
-                       1/16, 9/16, 1/16, 1/16,
-                       1/16, 1/16, 9/16, 1/16,
-                       1/16, 1/16, 1/16, 9/16), nrow=4, byrow=TRUE)
 
 
 #----------------------#
@@ -842,11 +1867,13 @@ df = df_raw %>%
   separate(X, into=c('gene', 'humvar'), "_")
 
 # Predicted categories 
-df_categories_raw = read.csv('./data/processed/annotated_variants_90k.csv')
+df_categories_raw = read.csv('./data/processed/annotated_variants_90k_revised.csv')
 df_categories = keep_relevant_cols_from_df_categories(df_categories_raw)
 
 # Merge NaP-TRAP and categories
-df = merge(df, df_categories, by='humvar', all.x=TRUE, all.y=FALSE)
+df = merge(df, df_categories, 
+           by.x=c('gene','humvar'), 
+           by.y=c('gene_id', 'humvar'), all.x=TRUE, all.y=FALSE)
 
 
 #-------------------#
@@ -878,108 +1905,138 @@ if (remove_input_0_spec){
                             str_interp("0 input in any of the 4 replicates"))
 }
 
-# 4. Add epsilon to all input and pulldown 
+# 4. Remove genes with median = 0
+if (remove_median_0_spec){
+  df = remove_genes_with_0_median(df)
+  sumstats_df = add_sumstat(df, sumstats_df, "Remove genes with 0 median")
+}
+
+# 5. Add epsilon to all input and pulldown 
 df = add_epsilon(df, epsilon_spec)
 
-# 5. Normalize (RPM or spikein)
-df = normalize_replicates(df, normalization_spec)
+# 6. Normalize (RPM or spikein)
+df = normalize_replicates(df, normalization_spec, df_spikeins)
 
-# 4. Calculate translation values as pulldown/input
+# 7. Calculate translation values as pulldown/input
 df = calculate_translation(df)
- 
-# 5. Calculate delta translation (based on median or reference)
+
+# 8. Calculate delta translation (based on median or reference)
 df = calculate_delta_translation(df, reference_spec)
 sumstats_df = add_sumstat(df, sumstats_df, "Remove reference reporters")
 
-# 6. Calculate fold changes
-df = calculate_fold_changes(df)
-
-# 7. Calculate SE based on bins of expected pulldown
-df = calculate_SE_diploid(df)
-df = calculate_SE_delta(df)
-
-# QC plots
-# plot_mean_expected_pulldown_vs_SE(df, 'diploid')
-# plot_mean_expected_pulldown_vs_SE(df, 'delta_t')
-
-# 8. Calculate precision-weighted mean and SE 
-df = calculate_prec_mean_and_se_diploid(df)
-df = calculate_prec_mean_and_se_delta_t(df)
-
-# 9. Ash
-df = run_ash(df, n_categories=4, 
-             'pw_mean_log2_diploid', 'pw_se_log2_diploid',
-             'ash_posterior_mean_log2_diploid', 'ash_posterior_se_log2_diploid')
-
-# df = run_ash(df, n_categories=4,
-#             'pw_mean_log2_delta_t', 'pw_se_log2_delta_t',
-#             'ash_posterior_mean_log2_delta_t', 'ash_posterior_se_log2_delta_t')
-
-sumstats_df = add_sumstat(df, sumstats_df, "Remove variants with missing predicted category")
-
-# 10. Transform diploid back to log2 delta
-transform_diploid_to_haploid = function(df, 
-                                        ash_diploid_mean_colname, 
-                                        ash_diploid_se_colname, all_reps){
-  
-  df = df %>%
-    
-    rename(diploid=ash_diploid_mean_colname,
-           diploid_se=ash_diploid_se_colname) %>%
-
-    rowwise() %>% 
-    
-    # Naive transformation of diploid to haploid  
-    mutate(naive_haploid = log2((2^diploid-1)*2 + 1),
-           
-           # Second derivative of naive transformation 
-           d2_dx2_haploid = - (2^(diploid+1)*log(2)) / ((2^(diploid+1)-1)^2),
-           
-           # Transformation
-           haploid = naive_haploid + 0.5*d2_dx2_haploid*(diploid^2 + diploid_se))
-  
-  if (all_reps){
-    
-    # Rename back to ash_posterior_mean_log2_delta_t so it's compatible with 
-    # downstream functions
-    df = df %>%
-      rename(ash_posterior_mean_log2_delta_t='haploid',
-             
-             # Rename diploid colnames back 
-             ash_posterior_mean_log2_diploid='diploid',
-             ash_posterior_se_log2_diploid='diploid_se')
-    
-  } else {
-    
-    df = df %>%
-      rename(ash_posterior_mean_3reps='haploid')
-  }
-           
-  return(df)
-  
-  
+if (reference_spec == 'median'){
+  sumstats_df = add_sumstat(df, sumstats_df, "Remove reference reporters")
+} else {
+  sumstats_df = add_sumstat(df, sumstats_df, "Remove reference reporters and variants without ref")
 }
 
-df = transform_diploid_to_haploid(df, 
-                                  'ash_posterior_mean_log2_diploid',
-                                  'ash_posterior_se_log2_diploid', all_reps=TRUE)
+# 9. Remove variants w/o predicted category 
+df = df %>% filter(is.na(predicted_category) == FALSE)
+sumstats_df = add_sumstat(df, sumstats_df, 
+                          "Remove variants w/o predicted category (NFASC tiling, missing references)")
 
-# 10. Save data
-write.csv(df, './data/processed/humvar_5utr_ntrap_v6_ash.csv', row.names=FALSE)
+# 10. Calculate fold changes
+df = calculate_diploid_fold_changes(df)
+
+# 11. Calculate SE based on bins of expected pulldown
+df = calculate_expected_pulldown(df)
+
+df = calculate_se(df, 'log2_diploid_fc', n_bins)
+df = calculate_se(df, 'delta_t', n_bins)
+df = calculate_se_translation(df)
+
+# QC plots
+plot_expected_pulldown_vs_SE(df, 'diploid')
+plot_expected_pulldown_vs_SE(df, 'delta_t')
+plot_expected_pulldown_vs_SE(df, 'translation')
+
+plot_expected_pulldown_vs_pulldown(df, 'diploid')
+plot_expected_pulldown_vs_pulldown(df, 'delta_t')
+plot_expected_pulldown_vs_pulldown(df, 'translation')
+
+# 12. Calculate precision-weighted mean and SE 
+df = calculate_prec_mean_and_se_diploid(df)
+df = calculate_prec_mean_and_se_delta_t(df)
+df = calculate_prec_mean_and_se_translation(df)
+
+# 13. Run ash on diploid
+df = run_ash(df, n_categories=4, 
+             'pw_mean_log2_diploid', 'pw_se_log2_diploid',
+             'ash_posterior_mean_log2_diploid', 
+             'ash_posterior_se_log2_diploid')
+
+# 14a. Run ash on delta T
+df = run_ash_delta_t(df, n_categories=4, 
+                     'pw_mean_delta_t', 'pw_se_delta_t',
+                     'ash_posterior_mean_delta', 
+                     'ash_posterior_se_delta')
+
+# 14b. Construct log2(delta T)
+df = df %>%
+  mutate(log2_ash_posterior_mean_delta = log2(ash_posterior_mean_delta))
+
+# 15. Transform delta T to translation
+df = transform_haploid_to_translation(df,
+                                      'ash_posterior_mean_delta',
+                                      'ash_posterior_se_delta', TRUE)
+
+# 16. Save data
+write.csv(df, './data/humvar_5utr_ntrap_ash_v7.csv', 
+          row.names=FALSE)
 
 
-#-------------------------------------#
-# ASH PLOTS — COMPARISONS & OUTLIERS  #
-#-------------------------------------#
+#---------------------------------------------#
+# DIPLOID — PLOTS & LEAVE-ONE-OUT VALIDATION  #
+#---------------------------------------------#
 plot_pre_vs_post_ash_scatter(df, 'diploid')
-plot_pre_vs_post_ash_scatter(df, 'delta_t')
-
 plot_pre_and_post_ash_distributions(df, 'diploid')
-plot_pre_and_post_ash_distributions(df, 'delta_t')
+
+leave_one_out_validation_diploid(df, 1)
+leave_one_out_validation_diploid(df, 2)
+leave_one_out_validation_diploid(df, 3)
+leave_one_out_validation_diploid(df, 4)
 
 
-#---------------------------#
-# LEAVE ONE OUT VALIDATION  #
-#---------------------------#
-leave_one_out_validation(df, 'diploid', 'log2_diploid_fc4')
-leave_one_out_validation(df, 'delta_t', 'log2_delta_t4')
+#---------------------------------------------#
+# HAPLOID — PLOTS & LEAVE-ONE-OUT VALIDATION  #
+#---------------------------------------------#
+plot_pre_vs_post_ash_scatter(df, 'delta_t_new')
+plot_pre_vs_post_ash_scatter(df, 'log2_delta_t')
+plot_pre_and_post_ash_distributions(df, 'delta_t_new')
+
+leave_one_out_validation_delta_new(df, 1)
+leave_one_out_validation_delta_new(df, 2)
+leave_one_out_validation_delta_new(df, 3)
+leave_one_out_validation_delta_new(df, 4)
+
+
+#-------------------------------------------------#
+# TRANSLATION — PLOTS & LEAVE-ONE-OUT VALIDATION  #
+#-------------------------------------------------#
+plot_pre_vs_post_ash_scatter(df, 'translation')
+plot_pre_and_post_ash_distributions(df, 'translation')
+
+leave_one_out_validation_translation_transformed(df, 1)
+leave_one_out_validation_translation_transformed(df, 2)
+leave_one_out_validation_translation_transformed(df, 3)
+leave_one_out_validation_translation_transformed(df, 4)
+
+
+#-----------------------------------------------#
+# TRANSLATION — PRECISION-WEIGHTED MEAN AND SE  # 
+#-------------------------------------------------#
+leave_one_out_validation_translation(df, 1)
+leave_one_out_validation_translation(df, 2)
+leave_one_out_validation_translation(df, 3)
+leave_one_out_validation_translation(df, 4)
+
+
+#-----------------#
+# DATA FOR ZIWEI  #
+#-----------------#
+df_ziwei = df %>%
+  select(gene, insert_seq, ash_posterior_mean_delta) %>%
+  rename(effect_on_translation = 'ash_posterior_mean_delta')
+
+write.csv(df_ziwei, './data_for_ziwei/naptrap_v7_ziwei.csv', 
+          row.names=FALSE)
