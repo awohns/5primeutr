@@ -5,7 +5,7 @@ library(dplyr)
 
 setwd('~/Desktop/5prime_utr/')
 
-df = read.csv('./data/processed/humvar_5utr_ntrap_ash_v7.csv')
+df = read.csv('./data/humvar_5utr_ntrap_ash_v7.csv')
 
 
 #-------------------#
@@ -35,9 +35,7 @@ df_neg_outliers = df %>%
   select(humvar, gene, 
          orf_ann_ref, orf_ann_alt,
          variant_type, variant_type_adjusted,
-         pw_mean_log2_diploid, 
-         ash_posterior_mean_log2_diploid,
-         ash_posterior_mean_log2_delta_t,
+         ash_posterior_mean_delta,
          ref_seq, insert_seq)
 
 tmp = data.frame(table(df_neg_outliers$variant_type_adjusted))
@@ -51,9 +49,7 @@ df_pos_outliers = df %>%
   select(humvar, gene, 
          orf_ann_ref, orf_ann_alt,
          variant_type, variant_type_adjusted,
-         pw_mean_log2_diploid, 
-         ash_posterior_mean_log2_diploid,
-         ash_posterior_mean_log2_delta_t,
+         ash_posterior_mean_delta,
          ref_seq, insert_seq)
 
 tmp = data.frame(table(df_pos_outliers$variant_type_adjusted))
@@ -67,9 +63,7 @@ df_null_negative_outliers = df %>%
   select(humvar, gene, 
          orf_ann_ref, orf_ann_alt,
          variant_type, variant_type_adjusted,
-         pw_mean_log2_diploid, 
-         ash_posterior_mean_log2_diploid,
-         ash_posterior_mean_log2_delta_t)
+         ash_posterior_mean_delta)
 
 tmp = data.frame(table(df_null_negative_outliers$variant_type_adjusted))
 View(tmp)
@@ -81,9 +75,7 @@ df_null_positive_outliers = df %>%
   select(humvar, gene, 
          orf_ann_ref, orf_ann_alt,
          variant_type, variant_type_adjusted,
-         pw_mean_log2_diploid, 
-         ash_posterior_mean_log2_diploid,
-         ash_posterior_mean_log2_delta_t)
+         ash_posterior_mean_delta)
 
 tmp = data.frame(table(df_null_positive_outliers$variant_type_adjusted))
 View(tmp)
@@ -95,9 +87,7 @@ df_total_loss_outliers = df %>%
   select(humvar, gene, 
          orf_ann_ref, orf_ann_alt,
          variant_type, variant_type_adjusted,
-         pw_mean_log2_diploid, 
-         ash_posterior_mean_log2_diploid,
-         ash_posterior_mean_log2_delta_t)
+         ash_posterior_mean_delta)
 
 tmp = data.frame(table(df_total_loss_outliers$variant_type_adjusted))
 View(tmp)
