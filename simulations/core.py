@@ -207,7 +207,7 @@ class Likelihoods:
                 #     lls_dict_remove_last_col = {}
                 #     for key, val in tqdm(
                 #         self.likelihoods[sample_size].items(), disable=not progress
-                #     ):  
+                #     ):
                 #         ll_curves_modified = val[0:-1, :-1]
 
                 #         # Calculate the sum of each column
@@ -237,9 +237,7 @@ class Likelihoods:
                 self.likelihoods = lls_dict_normalized
             else:
                 normalization_constants = {}
-                for key, val in tqdm(
-                    self.likelihoods.items(), disable=not progress
-                ):
+                for key, val in tqdm(self.likelihoods.items(), disable=not progress):
                     # for col in range(val.shape[1]):
                     # Remove the row of frequency = 0
                     ll_curves_modified = val[1:, :]
@@ -385,7 +383,9 @@ class Likelihoods:
         for s_het, beta in zip(self.s_het, self.betas):
             pos_beta_range = np.sqrt(self.S_GRID / (s_het * c_value))
             neg_beta_range = -np.sqrt(self.S_GRID / (s_het * c_value))
-            self.all_beta_ranges.append(np.concatenate([np.flip(neg_beta_range), pos_beta_range]))
+            self.all_beta_ranges.append(
+                np.concatenate([np.flip(neg_beta_range), pos_beta_range])
+            )
             # self.all_beta_ranges.append(np.sort(beta_range))
         self.all_beta_ranges = np.array(self.all_beta_ranges)
         loc = np.expand_dims(self.betas, axis=-1)  # Shape becomes (80330, 1)
@@ -396,7 +396,9 @@ class Likelihoods:
         sd_zero = np.isclose(self.sds, 0)
         self.all_weights[sd_zero] = np.zeros_like(self.all_weights[sd_zero])
         expanded_betas = self.betas[sd_zero][:, np.newaxis]
-        min_indices = np.argmin(np.abs(expanded_betas - self.all_beta_ranges[sd_zero]), axis=1)
+        min_indices = np.argmin(
+            np.abs(expanded_betas - self.all_beta_ranges[sd_zero]), axis=1
+        )
         self.all_weights[sd_zero, min_indices] = 1
 
         assert ~np.any(np.isnan(self.all_weights))
@@ -405,37 +407,44 @@ class Likelihoods:
         # Precalculate P(S|AF>0) = P(S) * P(AF>0|S) / Constant
         # We need to renormalize the likelihoods by dividing by all nonzero columns
         self.cache_denominators = []
-        
+
         for index, (closest_context, closest_sample_size) in tqdm(
-            enumerate(zip(closest_contexts, closest_sample_sizes)), disable= not progress):
+            enumerate(zip(closest_contexts, closest_sample_sizes)), disable=not progress
+        ):
             closest_ll = self.likelihoods[int(closest_sample_size)][closest_context]
             # for closest_s, s_cur in enumerate(self.S_GRID):
-            llhood = self.normalization_constants[closest_sample_size][closest_context]#np.sum(closest_ll[1:, :], axis=0)
+            llhood = self.normalization_constants[closest_sample_size][
+                closest_context
+            ]  # np.sum(closest_ll[1:, :], axis=0)
             llhood = np.concatenate([np.flip(llhood), llhood])
             p_s = self.all_weights[index]
-            numerator = llhood * p_s 
+            numerator = llhood * p_s
             self.cache_denominators.append(numerator / np.sum(numerator))
 
     def compute_posterior_s(self, neutral_prob):
         self.posterior_s = []
         self.posterior_s_0 = []
         for index, (closest_context, closest_sample_size, beta) in enumerate(
-            zip(self.closest_contexts, self.closest_sample_sizes, self.betas)):
+            zip(self.closest_contexts, self.closest_sample_sizes, self.betas)
+        ):
             beta_range = self.all_beta_ranges[index]
             beta_index = np.argmin(np.abs(beta_range - beta))
-            af_greater_0 = self.normalization_constants[closest_sample_size][closest_context]
+            af_greater_0 = self.normalization_constants[closest_sample_size][
+                closest_context
+            ]
             af_greater_0 = np.concatenate([np.flip(af_greater_0), af_greater_0])
             posterior_s = (1 - neutral_prob) * af_greater_0[beta_index]
-            posterior_s_0 = neutral_prob * self.normalization_constants[closest_sample_size][closest_context][0]
+            posterior_s_0 = (
+                neutral_prob
+                * self.normalization_constants[closest_sample_size][closest_context][0]
+            )
             constant = posterior_s + posterior_s_0
             if constant != 0:
-                self.posterior_s.append(posterior_s/constant)
-                self.posterior_s_0.append(posterior_s_0/constant)
+                self.posterior_s.append(posterior_s / constant)
+                self.posterior_s_0.append(posterior_s_0 / constant)
             else:
                 self.posterior_s.append(0)
                 self.posterior_s_0.append(0)
-
-
 
     def load_data(
         self,
@@ -468,10 +477,10 @@ class Likelihoods:
 
         self.closest_sample_sizes = []
         self.closest_contexts = []
-        for index, (context, sample_size) in enumerate(zip(contexts, sample_sizes)):
-            # if sample_size >= np.max(qs):
-            # closest_sample_size = self.sample_size_keys[-1]
-            if sample_size in self.sample_size_keys:
+        for index, (context, sample_size) in tqdm(enumerate(zip(contexts, sample_sizes)), disable=not progress):
+            if sample_size >= np.max(self.sample_size_keys):
+                closest_sample_size = self.sample_size_keys[-1]
+            elif sample_size in self.sample_size_keys:
                 closest_sample_size = sample_size
             else:
                 closest_sample_size = self.sample_size_keys[
@@ -499,7 +508,7 @@ class Likelihoods:
         if self.normalized:
             self.qs = self.qs.astype(int) - 1
         else:
-            # if not normalized 
+            # if not normalized
             self.qs = self.qs.astype(int)
         self.contexts = np.array(contexts)
 
@@ -507,14 +516,15 @@ class Likelihoods:
         self.param_history = []
         self.likelihood_history = []
 
-
     def quadratic_s(self, c, shet, beta):
         """
         Return the selection coefficient s, under a quadratic model where s = c * shet * beta**2
         """
-        return c * shet * beta ** 2
+        return c * shet * beta**2
 
-    def compute_ll_piecewise_bin_no_se_no_neutral(self, c, bin_left, bin_right, progress=True):
+    def compute_ll_piecewise_bin_no_se_no_neutral(
+        self, c, bin_left, bin_right, progress=True
+    ):
         """
         Compute likelihood of data in a particular bin given c, without considering standard errors
         from ash or a neutral proportion. Bin edges are inclusive on the left and exclusive on the
@@ -533,12 +543,16 @@ class Likelihoods:
         context_include = self.closest_contexts[bool_include]
         # iterate over data points, multiplying likelihoods to find the total_ll
         total_ll = 0
-        for s_index, q_index, sample_size, context in zip(closest_s_index, q_include, sample_size_include, context_include):
-            llhood = self.likelihoods[sample_size][context][q_index, s_index]
+        for s_index, q_index, sample_size, context in zip(
+            closest_s_index, q_include, sample_size_include, context_include
+        ):
+            llhood = self.likelihoods[sample_size][context][q_index - 1, s_index]
             total_ll += np.log(llhood)
-        return - total_ll
+        return -total_ll
 
-    def compute_ll_piecewise_bin_no_se(self, c, neutral_prop, bin_left, bin_right, progress=True):
+    def compute_ll_piecewise_bin_no_se(
+        self, c, neutral_prop, bin_left, bin_right, progress=True
+    ):
         """
         Compute likelihood of data in a particular bin given c, without considering standard errors
         from ash. Bin edges are inclusive on the left and exclusive on the
@@ -557,11 +571,116 @@ class Likelihoods:
         context_include = self.closest_contexts[bool_include]
         # iterate over data points, multiplying likelihoods to find the total_ll
         total_ll = 0
-        for s_index, q_index, sample_size, context in zip(closest_s_index, q_include, sample_size_include, context_include):
-            llhood = self.likelihoods[sample_size][context][q_index, s_index]
+        for s_index, q_index, sample_size, context in zip(
+            closest_s_index, q_include, sample_size_include, context_include
+        ):
+            llhood = self.likelihoods[sample_size][context][q_index - 1, s_index]
             llhood_neutral = self.likelihoods[sample_size][context][q_index, 0]
-            total_ll += np.log((llhood * (1 - neutral_prop)) + (llhood_neutral * neutral_prop))
-        return - total_ll
+            total_ll += np.log(
+                (llhood * (1 - neutral_prop)) + (llhood_neutral * neutral_prop)
+            )
+        return -total_ll
+
+    def compute_ll_piecewise_bin(
+        self, c, neutral_prop, bin_left, bin_right, shet_bin_left, shet_bin_right, progress=True
+    ):
+        """
+        Compute likelihood of data in a particular bin given c, considering standard errors
+        from ash. Bin edges are inclusive on the left and exclusive on the
+        right, i.e.: [bin_left, bin_right)
+        """
+        assert not self.normalized
+        assert bin_right > bin_left
+        # calculate s given c and shet
+        s = self.s_het * c
+        # find the closest s index in the likelihood table for each included data point
+        closest_s_index = [np.argmin(np.abs(self.S_GRID - s_val)) for s_val in s]
+        # iterate over data points, multiplying likelihoods to find the total_ll
+        total_ll = 0
+        incl = 0
+        for s_index, q_index, beta, sd, sample_size, context, s_het in zip(
+            closest_s_index,
+            self.qs,
+            self.betas,
+            self.sds,
+            self.closest_sample_sizes,
+            self.closest_contexts,
+            self.s_het,
+        ):
+            # calculate how much we should weight this data point in this bin
+            weight = norm.cdf(bin_right, loc=beta, scale=sd) - norm.cdf(
+                bin_left, loc=beta, scale=sd
+            )
+            if weight > 1e-1 and s_het > shet_bin_left and s_het < shet_bin_right:
+                incl +=1
+                if s_index == self.S_GRID.shape[0] - 1:
+                    s_index = s_index - 1
+
+                denom = self.normalization_constants[sample_size][context][s_index]
+                neutral_denom = self.normalization_constants[sample_size][context][0]
+                llhood = (
+                    self.likelihoods[sample_size][context][q_index, s_index] * weight
+                )
+                llhood_neutral = (
+                    self.likelihoods[sample_size][context][q_index, 0] * weight
+                )
+                # TODO: need to take average of ratios rather than ratio of averages (or vice versa?)
+                cur_ll = np.log(
+                    ((llhood/denom) * (1 - neutral_prop)) + ((llhood_neutral/neutral_denom) * neutral_prop)
+                )
+                if np.isnan(cur_ll) or np.isinf(cur_ll):
+                    print(s_index, llhood, denom, llhood_neutral, neutral_denom)
+                else:
+                    total_ll += cur_ll
+                #print(llhood/denom * (1-neutral_prop)>(llhood_neutral/neutral_denom) * neutral_prop, s_index, q_index)
+        print(incl)
+        return -total_ll
+
+
+    def compute_ll_piecewise_no_normalization_bin(
+        self, c, neutral_prop, bin_left, bin_right, shet_bin_left, shet_bin_right, progress=True
+    ):
+        """
+        Compute likelihood of data in a particular bin given c, considering standard errors
+        from ash. Bin edges are inclusive on the left and exclusive on the
+        right, i.e.: [bin_left, bin_right)
+        """
+        assert not self.normalized
+        assert bin_right > bin_left
+        # calculate s given c and shet
+        s = self.s_het * c
+        # find the closest s index in the likelihood table for each included data point
+        closest_s_index = [np.argmin(np.abs(self.S_GRID - s_val)) for s_val in s]
+        # iterate over data points, multiplying likelihoods to find the total_ll
+        total_ll = 0
+        ll_list = []
+        for s_index, q_index, beta, sd, sample_size, context, s_het in tqdm(zip(
+            closest_s_index,
+            self.qs,
+            self.betas,
+            self.sds,
+            self.closest_sample_sizes,
+            self.closest_contexts,
+            self.s_het,
+            ), disable = not progress):
+            # calculate how much we should weight this data point in this bin
+            if s_het > shet_bin_left and s_het < shet_bin_right:
+                weight = norm.cdf(bin_right, loc=beta, scale=sd) - norm.cdf(
+                    bin_left, loc=beta, scale=sd
+                )
+                if weight > 1e-1:
+                    llhood = (
+                        self.likelihoods[sample_size][context][q_index, s_index] * weight
+                    )
+                    llhood_neutral = (
+                        self.likelihoods[sample_size][context][q_index, 0] * weight
+                    )
+                    ll = np.log(
+                        ((llhood) * (1 - neutral_prop)) + ((llhood_neutral) * neutral_prop)
+                    )
+                    ll_list.append(ll)
+                    total_ll += ll
+        return -total_ll, ll_list
 
     def compute_ll_quadratic(self, params, progress=True):
         """
@@ -581,7 +700,7 @@ class Likelihoods:
             c = params[0]
             neutral_prob = 0
             separate_cs = False
-        self.prior_s(c) 
+        self.prior_s(c)
         if not self.normalized:
             self.create_ll_cache(self.closest_contexts, self.closest_sample_sizes)
         # # cache_beta_range = {}
@@ -628,7 +747,7 @@ class Likelihoods:
 
         # # Sum along axis 1 and reshape for broadcasting
         # weights_sum = np.sum(self.all_weights, axis=1)[:, np.newaxis]
-        
+
         # # Normalize weights
         # self.all_weights = self.all_weights / weights_sum
         # assert ~np.any(np.isnan(self.all_weights))
@@ -682,109 +801,117 @@ class Likelihoods:
             ),
             disable=not progress,
         ):
-
             # if not np.isclose(sd, 0):
-            
-                # ll_dict.cache_denominators contains P(AF>0|s)
-    
-                
-                # prob = np.sum(
-                #     np.exp(
-                #         np.log(self.likelihoods[sample_size][context][q_index])
-                #         + np.log(weights)
-                #     )#[weights != 0]
-                # )
-                # denominator = np.sum(self.cache_denominators[context + "_" + str(sample_size)] * weights)
-                # denominator = denominator / np.sum(denominator)
-                # denominator = np.sum(
-                    # np.exp(
-                        # np.log(
-                            # self.cache_denominators[context + "_" + str(sample_size)]
-                        # )
-                        # + np.log(weights)
-                    # )#[weights != 0]
-                # )
+
+            # ll_dict.cache_denominators contains P(AF>0|s)
+
+            # prob = np.sum(
+            #     np.exp(
+            #         np.log(self.likelihoods[sample_size][context][q_index])
+            #         + np.log(weights)
+            #     )#[weights != 0]
+            # )
+            # denominator = np.sum(self.cache_denominators[context + "_" + str(sample_size)] * weights)
+            # denominator = denominator / np.sum(denominator)
+            # denominator = np.sum(
+            # np.exp(
+            # np.log(
+            # self.cache_denominators[context + "_" + str(sample_size)]
+            # )
+            # + np.log(weights)
+            # )#[weights != 0]
+            # )
 
             # else:
 
-                # prob = 0
-                # denominator = 0
-                # cur_ll_curve = self.likelihoods[sample_size][context]
-                # beta_range = self.all_beta_ranges[index]  # [(s_het, beta)]
-                # # print(np.argmin(np.abs((c * s_het * beta ** 2) - self.S_GRID)))
-                # beta_index = np.argmin(np.abs(np.abs(beta) - beta_range))
+            # prob = 0
+            # denominator = 0
+            # cur_ll_curve = self.likelihoods[sample_size][context]
+            # beta_range = self.all_beta_ranges[index]  # [(s_het, beta)]
+            # # print(np.argmin(np.abs((c * s_het * beta ** 2) - self.S_GRID)))
+            # beta_index = np.argmin(np.abs(np.abs(beta) - beta_range))
 
-                # prob = cur_ll_curve[q_index, beta_index]
-                # # print(prob, sample_size, context, q_index, beta_index)                
-                # denominator = self.cache_denominators[context + "_" + str(sample_size)][
-                #     beta_index
-                # ]
+            # prob = cur_ll_curve[q_index, beta_index]
+            # # print(prob, sample_size, context, q_index, beta_index)
+            # denominator = self.cache_denominators[context + "_" + str(sample_size)][
+            #     beta_index
+            # ]
 
-                # for closest_s, s_cur in enumerate(self.S_GRID):
-                #     if weights[closest_s] != 0 and cur_ll_curve[q_index, closest_s] != 0:
-                #         prob += np.exp(
-                #             np.log(cur_ll_curve[q_index, closest_s])
-                #             + np.log(weights[closest_s])
-                #         )
-                #         np.seterr(invalid="raise")
-                #         denominator += np.exp(
-                #             np.log(
-                #                 self.cache_denominators[
-                #                     context + "_" + str(closest_sample_size)
-                #                 ][closest_s]
-                #             )
-                #             + np.log(weights[closest_s])
-                #         )
+            # for closest_s, s_cur in enumerate(self.S_GRID):
+            #     if weights[closest_s] != 0 and cur_ll_curve[q_index, closest_s] != 0:
+            #         prob += np.exp(
+            #             np.log(cur_ll_curve[q_index, closest_s])
+            #             + np.log(weights[closest_s])
+            #         )
+            #         np.seterr(invalid="raise")
+            #         denominator += np.exp(
+            #             np.log(
+            #                 self.cache_denominators[
+            #                     context + "_" + str(closest_sample_size)
+            #                 ][closest_s]
+            #             )
+            #             + np.log(weights[closest_s])
+            #         )
             if not self.normalized:
                 weights = self.all_weights[index]  # cache_weights[(s_het, beta, sd)]
                 llhood = self.likelihoods[sample_size][context][q_index, :]
-                # Note the likelihoods are determined with a grid of S, but S = c * beta **2 * shet, and we want it in terms of beta, so we have to 
+                # Note the likelihoods are determined with a grid of S, but S = c * beta **2 * shet, and we want it in terms of beta, so we have to
                 # account for positive and negative beta
                 numerator = np.concatenate([np.flip(llhood), llhood])
-                numerator = numerator[1:] #* np.diff(self.all_beta_ranges[index]) * self.all_weights[index][1:]
+                numerator = numerator[
+                    1:
+                ]  # * np.diff(self.all_beta_ranges[index]) * self.all_weights[index][1:]
                 # The denominator is p(AF>0|s)
                 # denominator = np.sum(self.likelihoods[sample_size][context][1:, :], axis=0)
                 denominator = self.normalization_constants[sample_size][context]
                 denominator = np.concatenate([np.flip(denominator), denominator])
-                denominator = denominator[1:] #* np.diff(self.all_beta_ranges[index]) * self.all_weights[index][1:]
+                denominator = denominator[
+                    1:
+                ]  # * np.diff(self.all_beta_ranges[index]) * self.all_weights[index][1:]
 
-                llhood = (numerator/denominator) #* np.diff(self.all_beta_ranges[index])# * self.all_weights[index][1:]
+                llhood = (
+                    numerator / denominator
+                )  # * np.diff(self.all_beta_ranges[index])# * self.all_weights[index][1:]
                 # print(numerator, denominator)
                 llhood[np.isnan(llhood)] = 0
-                prob = np.nansum(
-                                (llhood) *
-                                 self.cache_denominators[index][1:])
+                prob = np.nansum((llhood) * self.cache_denominators[index][1:])
             if neutral_prob != 0:
                 neutral_ll = self.likelihoods[sample_size][context][q_index, 0]
                 if self.normalized:
-                    numerator = (prob * (1 - neutral_prob)) + (neutral_ll * neutral_prob)
+                    numerator = (prob * (1 - neutral_prob)) + (
+                        neutral_ll * neutral_prob
+                    )
                     total_ll += numerator
                     results.append(numerator)
                 else:
-                    # Normalization: we want the unnormalized probability divided by the normalization    
+                    # Normalization: we want the unnormalized probability divided by the normalization
                     # Probability of s = 0 given AF > 0
                     beta_range = self.all_beta_ranges[index]
                     norm_constant = self.normalization_constants[sample_size][context]
-                    posterior = ((self.all_weights[index][np.argmin(np.abs(beta_range-0))] * norm_constant[0]) /
-                        np.sum(norm_constant))
-                    neutral = (neutral_ll / norm_constant[0]) #* posterior
+                    posterior = (
+                        self.all_weights[index][np.argmin(np.abs(beta_range - 0))]
+                        * norm_constant[0]
+                    ) / np.sum(norm_constant)
+                    neutral = neutral_ll / norm_constant[0]  # * posterior
                     # denominator = (denominator * (1 - neutral_prob)) + (
-                        # self.cache_denominators[context + "_" + str(sample_size)][0]
-                        # * neutral_prob
+                    # self.cache_denominators[context + "_" + str(sample_size)][0]
+                    # * neutral_prob
                     # )
                     # The last column (highest s value) has all of its probability mass on singletons.
                     # This means we can have an issue where the probability is 0 and denominator is 0 if the frequency is non-singleton
                     # Hacky fix here is to just add a very small probability
                     # if denominator == 0 and prob == 0:
-                        # raise ValueError
-                        # total_ll += -np.log(np.nextafter(0, 1))
+                    # raise ValueError
+                    # total_ll += -np.log(np.nextafter(0, 1))
                     # else:
                     try:
                         if -np.log((prob * (1 - neutral_prob)) + neutral) == -np.inf:
                             # print(prob, neutral, neutral_ll, norm_constant, beta, beta_index)
                             continue
                         # print(-np.log(prob * (1 - neutral_prob)) + (neutral * neutral_prob), prob, neutral, neutral_prob)
-                        total_ll += -np.log((prob * (1 - neutral_prob)) + (neutral * neutral_prob))
+                        total_ll += -np.log(
+                            (prob * (1 - neutral_prob)) + (neutral * neutral_prob)
+                        )
                         # total_ll += numerator / denominator
                         results.append(numerator / denominator)
                     except FloatingPointError as e:
@@ -799,7 +926,7 @@ class Likelihoods:
                     beta_range = np.sqrt(self.S_GRID / (s_het * c))
                     beta_index = np.argmin(np.abs(np.abs(beta) - beta_range))
                     llhood = self.likelihoods[sample_size][context][q_index, beta_index]
-                    # Note the likelihoods are determined with a grid of S, but S = c * beta **2 * shet, and we want it in terms of beta, so we have to 
+                    # Note the likelihoods are determined with a grid of S, but S = c * beta **2 * shet, and we want it in terms of beta, so we have to
                     # account for positive and negative beta
                     # llhood = np.concatenate([np.flip(llhood), llhood])
                     # print(c, beta, beta_index, q_index, llhood)
@@ -807,28 +934,25 @@ class Likelihoods:
                     # raise ValueError
                     # results.append(prob)
                 else:
-                    
                     # The last column (highest s value) has all of its probability mass on singletons.
                     # This means we can have an issue where the probability is 0 and denominator is 0 if the frequency is non-singleton
                     # Hacky fix here is to just add a very small probability
                     # if denominator == 0 and prob == 0:
 
-                        # print(sample_size, context, beta_index, q_index, beta, sd, s_het, -np.log(prob / denominator) )
-                        # continue
-                        # raise ValueError
+                    # print(sample_size, context, beta_index, q_index, beta, sd, s_het, -np.log(prob / denominator) )
+                    # continue
+                    # raise ValueError
 
                     # else:
 
                     # beta_range = self.all_beta_ranges[index]
                     # beta_index = np.argmin(np.abs(beta - beta_range))
                     # print(self.cache_denominators[index][beta_index], beta, beta_index, np.max(self.cache_denominators[index]))
-                    
-                    
-                    
+
                     # if not np.isnan((numerator/denominator)[beta_index]):
                     # print(prob, -np.log(prob))
-                    total_ll += -np.log(prob)# *
-                             #np.abs(np.diff(self.all_beta_ranges[index]))))
+                    total_ll += -np.log(prob)  # *
+                    # np.abs(np.diff(self.all_beta_ranges[index]))))
                     # if total_ll == np.inf:
                     #     print(beta, np.sum(llhood), np.sum(numerator), np.sum(denominator),
                     #         self.cache_denominators[index][1:], np.diff(self.all_beta_ranges[index]),
@@ -849,7 +973,7 @@ class Likelihoods:
             # print(c, neutral_prob, total_ll)
             self.param_history.append([c, neutral_prob])
             self.likelihood_history.append(total_ll)
-        return total_ll#, results
+        return total_ll  # , results
 
     def likelihood_ratio_test(self, neutral_ll, alt_ll):
         # Likelihood ratio test is -2 * ln(L_0) - ln(l_alt)
