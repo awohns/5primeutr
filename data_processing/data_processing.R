@@ -792,7 +792,8 @@ calculate_prec_mean_and_se_delta_t = function(df){
 
 # Ash
 run_ash = function(df, n_categories, mean_col, se_col, 
-                   posterior_mean_col, posterior_sd_col){
+                   posterior_mean_col, posterior_sd_col, 
+                   extract_lfdr=FALSE, posterior_lfdr_col=NA){
   
   df = data.frame(df)
   
@@ -816,41 +817,77 @@ run_ash = function(df, n_categories, mean_col, se_col,
     # Categories 
     categories = unique(na.omit(df$predicted_category))
     
-    # Run ash within each category 
-    for (category in categories){
+    if (extract_lfdr == FALSE){
       
-      # Subset variants in category 
-      tmp_df = df %>%
-        filter(predicted_category == category)
+      # Run ash within each category 
+      for (category in categories){
+        
+        # Subset variants in category 
+        tmp_df = df %>%
+          filter(predicted_category == category)
+        
+        if (category %in% c('Total loss')){
+          
+          # Run ash 
+          ash_results = 
+            ash(tmp_df[,mean_col], tmp_df[,se_col],
+                mixcompdist = 'normal', pi_thresh=0, pointmass=TRUE,
+                mode='estimate')
+          
+        } else {
+          
+          # Run ash 
+          ash_results = 
+            ash(tmp_df[,mean_col], tmp_df[,se_col],
+                mixcompdist = 'halfnormal', pointmass=TRUE, pi_thresh=0)
+        }
+        
+        ash_results_df = ash_results$result
+        ash_results_df = ash_results_df[,c('PosteriorMean', 'PosteriorSD')]
+        names(ash_results_df) = c(posterior_mean_col, posterior_sd_col)
+        
+        df_merged_results = cbind(tmp_df, ash_results_df)
+        
+        if (category == categories[1]){
+          df_post_ash = df_merged_results
+        } else {
+          df_post_ash = rbind(df_post_ash, df_merged_results)
+        }
+      }
       
-      if (category %in% c('Total loss')){
+    } else if (extract_lfdr == TRUE){
+      
+      # Run ash within each category 
+      for (category in categories){
         
-        # Run ash 
-        ash_results = 
-          ash(tmp_df[,mean_col], tmp_df[,se_col],
-              mixcompdist = 'normal', pi_thresh=0, pointmass=TRUE,
-              mode='estimate')
-        
-      } else {
+        # Subset variants in category 
+        tmp_df = df %>%
+          filter(predicted_category == category)
         
         # Run ash 
         ash_results = 
           ash(tmp_df[,mean_col], tmp_df[,se_col],
               mixcompdist = 'halfnormal', pointmass=TRUE, pi_thresh=0)
+        
+        ash_results_df = ash_results$result
+        ash_results_df = ash_results_df[,c('PosteriorMean', 'PosteriorSD', 'lfdr')]
+        names(ash_results_df) = c(posterior_mean_col, posterior_sd_col, posterior_lfdr_col)
+        
+        df_merged_results = cbind(tmp_df, ash_results_df)
+        
+        if (category == categories[1]){
+          df_post_ash = df_merged_results
+        } else {
+          df_post_ash = rbind(df_post_ash, df_merged_results)
+        }
       }
       
-      ash_results_df = ash_results$result
-      ash_results_df = ash_results_df[,c('PosteriorMean', 'PosteriorSD')]
-      names(ash_results_df) = c(posterior_mean_col, posterior_sd_col)
-      
-      df_merged_results = cbind(tmp_df, ash_results_df)
-      
-      if (category == categories[1]){
-        df_post_ash = df_merged_results
-      } else {
-        df_post_ash = rbind(df_post_ash, df_merged_results)
-      }
     }
+    
+    
+    
+    
+    
     
   } 
   
@@ -898,6 +935,50 @@ run_ash_delta_t = function(df, n_categories, mean_col, se_col,
   return(df_post_ash)
   
 }
+
+
+# Identify significant variants
+calculate_95ci_for_diploid = function(df){
+  
+  df = df %>%
+    rowwise() %>%
+   
+    mutate(ci_95_lower = 
+             ash_posterior_mean_log2_diploid-1.96*ash_posterior_se_log2_diploid,
+           ci_95_upper = 
+             ash_posterior_mean_log2_diploid+1.96*ash_posterior_se_log2_diploid) %>%
+    mutate(significant_diploid_95ci = 
+             ifelse(((ci_95_lower > 0 & ci_95_upper > 0) |
+                       (ci_95_lower < 0 & ci_95_upper < 0)), 1, 0)) %>%
+    
+    select(-ci_95_lower, -ci_95_upper) %>%
+    
+    ungroup()
+  
+  return(df)
+}
+
+calculate_95ci_for_delta = function(df){
+  
+  df = df %>%
+    rowwise() %>%
+    
+    mutate(ci_95_lower = 
+             ash_posterior_mean_delta-1.96*ash_posterior_se_delta,
+           ci_95_upper = 
+             ash_posterior_mean_delta+1.96*ash_posterior_se_delta) %>%
+    mutate(significant_delta_95ci = 
+             ifelse(((ci_95_lower > 1 & ci_95_upper > 1) |
+                       (ci_95_lower < 1 & ci_95_upper < 1)), 1, 0)) %>%
+    
+    select(-ci_95_lower, -ci_95_upper) %>%
+    
+    ungroup()
+  
+  return(df)
+  
+}
+
 
 
 # Ash plots
@@ -1270,6 +1351,8 @@ calculate_prec_mean_and_se_3replicates_diploid = function(df, replicate_n) {
 }
 
 leave_one_out_validation_diploid = function(df, replicate_n) {
+  
+  df = data.frame(df)
   
   all_replicates = c(1:4)
   replicates = setdiff(all_replicates, replicate_n)
@@ -1963,7 +2046,9 @@ df = calculate_prec_mean_and_se_translation(df)
 df = run_ash(df, n_categories=4, 
              'pw_mean_log2_diploid', 'pw_se_log2_diploid',
              'ash_posterior_mean_log2_diploid', 
-             'ash_posterior_se_log2_diploid')
+             'ash_posterior_se_log2_diploid',
+             TRUE,
+             'ash_posterior_lfdr_diploid')
 
 # 14a. Run ash on delta T
 df = run_ash_delta_t(df, n_categories=4, 
@@ -1980,8 +2065,12 @@ df = transform_haploid_to_translation(df,
                                       'ash_posterior_mean_delta',
                                       'ash_posterior_se_delta', TRUE)
 
-# 16. Save data
-write.csv(df, './data/humvar_5utr_ntrap_ash_v7.csv', 
+# 16. Mark significant variants
+df = calculate_95ci_for_diploid(df)
+df = calculate_95ci_for_delta(df)
+
+# 17. Save data
+write.csv(df, './data/humvar_5utr_ntrap_ash_v8.csv', 
           row.names=FALSE)
 
 
@@ -2030,13 +2119,3 @@ leave_one_out_validation_translation(df, 2)
 leave_one_out_validation_translation(df, 3)
 leave_one_out_validation_translation(df, 4)
 
-
-#-----------------#
-# DATA FOR ZIWEI  #
-#-----------------#
-df_ziwei = df %>%
-  select(gene, insert_seq, ash_posterior_mean_delta) %>%
-  rename(effect_on_translation = 'ash_posterior_mean_delta')
-
-write.csv(df_ziwei, './data_for_ziwei/naptrap_v7_ziwei.csv', 
-          row.names=FALSE)
