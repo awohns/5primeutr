@@ -472,10 +472,12 @@ annotate_variant_types = function(df_annotated, orf_types,
         orf_change_type = 'Complete loss of ORFs'
         variant_type_list = orf_change_type
         
-        if (grepl('main ORF', orfs_ref)){
+        if (any(grepl('main ORF', orfs_ref))){
           df_annotated[i,'lost_main_ORF'] = 1
-        } else if (grepl('inframe oORF', orfs_ref)){
+        } else if (any(grepl('inframe oORF', orfs_ref))){
           df_annotated[i,'lost_inframe_oORF'] = 1
+        } else if (any(grepl('outframe oORF', orfs_ref))){
+          df_annotated[i,'lost_outframe_oORF'] = 1 
         } else {
           print("Reference doesn't have a main ORF or inframe oORF. Adjust annotation accordingly!")
           print(i)
