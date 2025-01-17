@@ -20,6 +20,32 @@ setwd('/home/users/tami/5utr_extended_panel/data/')
 #------------#
 # FUNCTIONS  #
 #------------#
+replace_acgt <- function(input_sequence) {
+  output_sequence <- chartr("ACTG", "TGAC", input_sequence)
+  return(output_sequence)
+}
+
+complementary_ref_alt_neg_strand = function(ukb_df, ref_5utrs_df){
+  
+  tmp_df = merge(ukb_df, ref_5utrs_df %>%
+                   select(gene_name, Strand), by='gene_name')
+  
+  ukb_pos_df = tmp_df %>%
+    filter(Strand == "+") %>%
+    select(-Strand)
+  
+  ukb_neg_df = tmp_df %>%
+    filter(Strand == "-") %>%
+    mutate(REF = replace_acgt(REF),
+           ALT = replace_acgt(ALT)) %>%
+    select(-Strand)
+  
+  tmp_df = rbind(ukb_pos_df, ukb_neg_df)
+  
+  return(tmp_df)
+  
+}
+
 remove_reporters_within_10p_of_length = function(df, ref_df){
 
   tmp_df = merge(df, ref_df %>%
@@ -80,6 +106,16 @@ ukb_250_df = data.frame(fread(str_interp('./processed/UKB_variants_250_annotated
 invar_250_df = data.frame(fread(str_interp('./processed/invariant_250_annotated.csv')))
 ref_250_df = data.frame(fread(str_interp('./processed/references_250_annotated.csv')))
 
+# Remove * from sequences
+ukb_250_df = ukb_250_df %>%
+  mutate(ALT_sequence = gsub("\\*", "", ALT_sequence))
+
+invar_250_df = invar_250_df %>%
+  mutate(ALT_sequence = gsub("\\*", "", ALT_sequence))
+
+# Revert REF/ALT back to positive strand 
+ukb_250_df = complementary_ref_alt_neg_strand(ukb_250_df, ref_250_df)
+
 
 # UKB sumstats
 ukb_sumstats_df = data.frame(
@@ -107,6 +143,8 @@ invar_sumstats_df[nrow(invar_sumstats_df)+1, ] =
 # QUALITY CONTROL                                            #
 #   1. Keep reporters within 10% of length (REF and ALT)     #
 #   2. Remove duplicates (within and between)                #
+#   3. Remove reporters with adjusted length of 180          # 
+#      (to avoid duplicates with 750k panel)                 #
 #------------------------------------------------------------#
 
 # 1.
@@ -141,6 +179,25 @@ invar_sumstats_df[nrow(invar_sumstats_df)+1, ] =
       invar_sumstats_df[nrow(invar_sumstats_df),3],
       nrow(invar_250_df),
       nrow(invar_250_df) - as.numeric(invar_sumstats_df[nrow(invar_sumstats_df),3]))
+
+# 3.
+ukb_250_df = ukb_250_df %>%
+  filter(alt_seq_len_250bp_adjusted != 180)
+
+invar_250_df = invar_250_df %>%
+  filter(alt_seq_len_250bp_adjusted != 180)
+
+ukb_sumstats_df[nrow(ukb_sumstats_df)+1, ] =
+  c('Remove reporters with adjusted length = 180nt',
+    ukb_sumstats_df[nrow(ukb_sumstats_df),3],
+    nrow(ukb_250_df), length(unique(ukb_250_df$gene_name)),
+    nrow(ukb_250_df) - as.numeric(ukb_sumstats_df[nrow(ukb_sumstats_df),3]))
+
+invar_sumstats_df[nrow(invar_sumstats_df)+1, ] =
+  c('Remove reporters with adjusted length = 180nt',
+    invar_sumstats_df[nrow(invar_sumstats_df),3],
+    nrow(invar_250_df),
+    nrow(invar_250_df) - as.numeric(invar_sumstats_df[nrow(invar_sumstats_df),3]))
 
 
 #-----------------------------------------------#

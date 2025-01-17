@@ -20,6 +20,32 @@ setwd('/home/users/tami/5utr_extended_panel/data/')
 #------------#
 # FUNCTIONS  #
 #------------#
+replace_acgt <- function(input_sequence) {
+  output_sequence <- chartr("ACTG", "TGAC", input_sequence)
+  return(output_sequence)
+}
+
+complementary_ref_alt_neg_strand = function(ukb_df, ref_5utrs_df){
+  
+  tmp_df = merge(ukb_df, ref_5utrs_df %>%
+                   select(gene_name, Strand), by='gene_name')
+  
+  ukb_pos_df = tmp_df %>%
+    filter(Strand == "+") %>%
+    select(-Strand)
+  
+  ukb_neg_df = tmp_df %>%
+    filter(Strand == "-") %>%
+    mutate(REF = replace_acgt(REF),
+           ALT = replace_acgt(ALT)) %>%
+    select(-Strand)
+  
+  tmp_df = rbind(ukb_pos_df, ukb_neg_df)
+  
+  return(tmp_df)
+  
+}
+
 remove_reporters_within_10p_of_length = function(df, ref_df){
 
   tmp_df = merge(df, ref_df %>%
@@ -80,6 +106,16 @@ ukb_180_df = data.frame(fread(str_interp('./processed/UKB_variants_180_annotated
 invar_180_df = data.frame(fread(str_interp('./processed/invariant_180_annotated.csv')))
 ref_180_df = data.frame(fread(str_interp('./processed/references_180_annotated.csv')))
 
+# Remove * from sequences
+ukb_180_df = ukb_180_df %>%
+  mutate(ALT_sequence = gsub("\\*", "", ALT_sequence))
+
+invar_180_df = invar_180_df %>%
+  mutate(ALT_sequence = gsub("\\*", "", ALT_sequence))
+
+# Revert REF/ALT back to positive strand 
+ukb_180_df = complementary_ref_alt_neg_strand(ukb_180_df, ref_180_df)
+
 
 # UKB sumstats
 ukb_sumstats_df = data.frame(
@@ -90,7 +126,6 @@ ukb_sumstats_df[nrow(ukb_sumstats_df)+1, ] =
       ukb_sumstats_df[nrow(ukb_sumstats_df),3],
       nrow(ukb_180_df), length(unique(ukb_180_df$gene_name)),
       ukb_sumstats_df[nrow(ukb_sumstats_df),3] - nrow(ukb_180_df))
-
 
 # Invariant sumstats
 invar_sumstats_df = data.frame(
