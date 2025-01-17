@@ -29,9 +29,9 @@ n_invar = n*0.1
 # FUNCTIONS  #
 #------------#
 keep_one_per_duplicate = function(ref_5utrs_df){
-
+  
   duplicate_refs = ref_5utrs_df$ALT_sequence[duplicated(ref_5utrs_df$ALT_sequence)]
-
+  
   refs_duplicates_df = ref_5utrs_df %>%
     filter(ALT_sequence %in% duplicate_refs) %>%
     group_by(ALT_sequence) %>%
@@ -39,39 +39,39 @@ keep_one_per_duplicate = function(ref_5utrs_df){
       other_genes <- setdiff(gene_name, g)
       paste(other_genes, collapse = ', ')})) %>%
     ungroup()
-
+  
   ref_not_duplicated_df = ref_5utrs_df %>%
     filter(!(ALT_sequence %in% duplicate_refs)) %>%
     mutate(alternative_annotations = NA)
-
+  
   for (ref in duplicate_refs){
-
+    
     tmp_df = refs_duplicates_df %>%
       filter(ALT_sequence == ref)
-
+    
     keep_tmp_df = tmp_df[1,]
-
+    
     if (ref == duplicate_refs[1]){
       refs_keep_one_duplicate_df = keep_tmp_df
     } else {
       refs_keep_one_duplicate_df = rbind(refs_keep_one_duplicate_df, keep_tmp_df)
     }
   }
-
+  
   ref_df = rbind(ref_not_duplicated_df, refs_keep_one_duplicate_df)
-
+  
   return(ref_df)
-
+  
 }
 
 add_NA_missing_columns = function(ref_5utrs_panel_df, selected_vars_df){
-
+  
   missing_columns = setdiff(names(selected_vars_df), names(ref_5utrs_panel_df))
-
+  
   for (col_name in missing_columns) {
     ref_5utrs_panel_df[[col_name]] = NA
   }
-
+  
   return(ref_5utrs_panel_df)
 }
 

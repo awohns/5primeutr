@@ -236,7 +236,7 @@ selected_invar_null_df = invar_df %>%
 set.seed(123456)
 selected_invar_pos_df = invar_df %>%
   filter(predicted_category == "Positive") %>%
-  sample_n(0.5*n_invar_sites+1)
+  sample_n(0.5*n_invar_sites+2)
 
 set.seed(123456)
 selected_invar_neg_df = invar_df %>%
